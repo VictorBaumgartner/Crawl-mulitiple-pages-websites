@@ -14,7 +14,7 @@ async def crawl_website(start_url, max_pages=10, output_dir="markdown_files", ma
 
     md_generator = DefaultMarkdownGenerator(
         options={
-            "ignore_links": False,
+            "ignore_links": True,
             "escape_html": True,
             "body_width": 0
         }
@@ -95,8 +95,8 @@ async def crawl_website(start_url, max_pages=10, output_dir="markdown_files", ma
     print(f"Metadata saved to {metadata_path}")
 
 async def main():
-    target_url = "https://www.musee-foliemarco.com"
-    output_dir = r"C:\Users\victo\Desktop\crawl\musee_foliemarco"
+    target_url = "https://www.citedutrain.com/"
+    output_dir = r"C:\Users\victo\Desktop\crawl\citedutrain"
     await crawl_website(
         start_url=target_url,
         output_dir=output_dir,
