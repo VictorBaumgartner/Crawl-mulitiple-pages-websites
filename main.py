@@ -6,15 +6,34 @@ from urllib.parse import urljoin, urlparse
 from crawl4ai import AsyncWebCrawler, CrawlerRunConfig
 from crawl4ai.markdown_generation_strategy import DefaultMarkdownGenerator
 
+def clean_markdown(md_text):
+    """
+    Cleans Markdown content by:
+    - Removing inline and reference links
+    - Removing footnotes
+    - Removing images
+    - Removing raw URLs
+    - Compacting empty spaces
+    """
+    md_text = re.sub(r'\[([^\]]+)\]\((http[s]?://[^\)]+)\)', r'\1', md_text)
+    md_text = re.sub(r'http[s]?://\S+', '', md_text)
+    md_text = re.sub(r'!\[([^\]]*)\]\((http[s]?://[^\)]+)\)', '', md_text)
+    md_text = re.sub(r'\[\^?\d+\]', '', md_text)
+    md_text = re.sub(r'^\[\^?\d+\]:\s?.*$', '', md_text, flags=re.MULTILINE)
+    md_text = re.sub(r'\(\)', '', md_text)
+    md_text = re.sub(r'\n\s*\n', '\n\n', md_text)
+    md_text = re.sub(r'[ \t]+', ' ', md_text)
+    return md_text.strip()
+
 async def crawl_website(start_url, max_pages=10, output_dir="markdown_files", max_concurrency=5):
     """
-    Crawl a website deeply and save each page as a Markdown file, with parallelization.
+    Crawl a website deeply and save each page as a cleaned Markdown file, with parallelization.
     """
     os.makedirs(output_dir, exist_ok=True)
 
     md_generator = DefaultMarkdownGenerator(
         options={
-            "ignore_links": True,
+            "ignore_links": True,  # Not important because we clean after
             "escape_html": True,
             "body_width": 0
         }
@@ -50,18 +69,22 @@ async def crawl_website(start_url, max_pages=10, output_dir="markdown_files", ma
         visited_urls.add(current_url)
         print(f"Crawling ({len(visited_urls)}/{max_pages}): {current_url}")
 
-        async with semaphore:  # Control concurrency
+        async with semaphore:
             async with AsyncWebCrawler(verbose=True) as crawler:
                 result = await crawler.arun(url=current_url, config=config)
 
                 if result.success:
                     markdown_content = result.markdown.raw_markdown
+                    
+                    # ✅ Clean the Markdown before saving
+                    cleaned_markdown = clean_markdown(markdown_content)
+
                     filename = sanitize_filename(current_url)
                     output_path = os.path.join(output_dir, filename)
 
                     with open(output_path, "w", encoding="utf-8") as f:
-                        f.write(f"# {current_url}\n\n{markdown_content}\n")
-                    print(f"Saved: {output_path}")
+                        f.write(f"# {current_url}\n\n{cleaned_markdown}\n")
+                    print(f"Saved cleaned Markdown to: {output_path}")
 
                     internal_links = result.links.get("internal", [])
                     for link in internal_links:
@@ -79,7 +102,6 @@ async def crawl_website(start_url, max_pages=10, output_dir="markdown_files", ma
             await crawl_page(current_url)
             crawl_queue.task_done()
 
-    # Launch worker tasks
     tasks = []
     for _ in range(max_concurrency):
         tasks.append(asyncio.create_task(worker()))
@@ -101,7 +123,7 @@ async def main():
         start_url=target_url,
         output_dir=output_dir,
         max_pages=100,
-        max_concurrency=5  # Number of parallel requests
+        max_concurrency=5
     )
 
 if __name__ == "__main__":
