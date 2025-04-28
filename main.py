@@ -9,21 +9,45 @@ from crawl4ai.markdown_generation_strategy import DefaultMarkdownGenerator
 def clean_markdown(md_text):
     """
     Cleans Markdown content by:
-    - Removing inline and reference links
-    - Removing footnotes
-    - Removing images
-    - Removing raw URLs
-    - Compacting empty spaces
+    - Removing inline links, footnotes, raw URLs, images
+    - Removing bold, italic, blockquotes
+    - Removing empty headings
+    - Compacting whitespace
     """
+    # Remove Markdown links but keep the text
     md_text = re.sub(r'\[([^\]]+)\]\((http[s]?://[^\)]+)\)', r'\1', md_text)
+    
+    # Remove raw URLs
     md_text = re.sub(r'http[s]?://\S+', '', md_text)
+    
+    # Remove images
     md_text = re.sub(r'!\[([^\]]*)\]\((http[s]?://[^\)]+)\)', '', md_text)
+    
+    # Remove footnotes
     md_text = re.sub(r'\[\^?\d+\]', '', md_text)
     md_text = re.sub(r'^\[\^?\d+\]:\s?.*$', '', md_text, flags=re.MULTILINE)
+    
+    # Remove blockquotes
+    md_text = re.sub(r'^\s{0,3}>\s?', '', md_text, flags=re.MULTILINE)
+    
+    # Remove bold and italic formatting (**bold**, *italic*, __underline__, _italic_)
+    md_text = re.sub(r'(\*\*|__)(.*?)\1', r'\2', md_text)
+    md_text = re.sub(r'(\*|_)(.*?)\1', r'\2', md_text)
+    
+    # Remove empty headings (lines that are only '#', '##', etc.)
+    md_text = re.sub(r'^\s*#+\s*$', '', md_text, flags=re.MULTILINE)
+    
+    # Remove leftover empty parentheses
     md_text = re.sub(r'\(\)', '', md_text)
-    md_text = re.sub(r'\n\s*\n', '\n\n', md_text)
+    
+    # Compact multiple empty lines into one
+    md_text = re.sub(r'\n\s*\n+', '\n\n', md_text)
+    
+    # Clean extra spaces
     md_text = re.sub(r'[ \t]+', ' ', md_text)
+    
     return md_text.strip()
+
 
 async def crawl_website(start_url, max_pages=10, output_dir="markdown_files", max_concurrency=5):
     """
