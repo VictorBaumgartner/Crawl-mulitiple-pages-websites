@@ -1,98 +1,108 @@
 import asyncio
 import os
-from crawl4ai import AsyncWebCrawler, CrawlerRunConfig
-from crawl4ai.markdown_generation_strategy import DefaultMarkdownGenerator
-from urllib.parse import urljoin, urlparse
 import json
 import re
+from urllib.parse import urljoin, urlparse
+from crawl4ai import AsyncWebCrawler, CrawlerRunConfig
+from crawl4ai.markdown_generation_strategy import DefaultMarkdownGenerator
 
-async def crawl_website(url, max_pages=10, output_dir="markdown_files"):
+async def crawl_website(start_url, max_pages=10, output_dir="markdown_files", max_concurrency=5):
     """
-    Crawl a website and save a Markdown file for each URL with full body content.
-    
-    Args:
-        url (str): The starting URL of the website
-                max_pages (int): Maximum number of pages to crawl
-        output_dir (str): Directory to save Markdown files
+    Crawl a website deeply and save each page as a Markdown file, with parallelization.
     """
-    # Create output directory if it doesn't exist
     os.makedirs(output_dir, exist_ok=True)
-    
-    # Configure Markdown generator without pruning
+
     md_generator = DefaultMarkdownGenerator(
         options={
             "ignore_links": False,
             "escape_html": True,
-            "body_width": 0  # No width limit for full content
+            "body_width": 0
         }
     )
-    
-    # Crawler configuration
+
     config = CrawlerRunConfig(
         markdown_generator=md_generator,
         cache_mode="BYPASS",
         exclude_external_links=True,
         exclude_social_media_links=True,
     )
-    
-    # Track visited URLs to avoid duplicates
+
     visited_urls = set()
-    all_markdown = []
+    crawl_queue = asyncio.Queue()
+    crawl_queue.put_nowait(start_url)
+    semaphore = asyncio.Semaphore(max_concurrency)
 
     def sanitize_filename(url):
-        """Convert URL to a valid filename."""
         parsed = urlparse(url)
         path = parsed.path.strip("/").replace("/", "_") or "index"
         netloc = parsed.netloc.replace(".", "_")
         filename = f"{netloc}_{path}.md"
-        # Remove invalid characters for filenames
         filename = re.sub(r'[<>:"/\\|?*]', '_', filename)
-        return filename[:200]  # Truncate to avoid overly long filenames
-    
+        return filename[:200]
+
     async def crawl_page(current_url):
-        if len(visited_urls) >= max_pages or current_url in visited_urls:
+        if len(visited_urls) >= max_pages:
             return
-        
+
+        if current_url in visited_urls:
+            return
+
         visited_urls.add(current_url)
-        print(f"Crawling: {current_url} (Total pages: {len(visited_urls)})")
-        
-        async with AsyncWebCrawler(verbose=True) as crawler:
-            result = await crawler.arun(url=current_url, config=config)
-            
-            if result.success:
-                # Get full Markdown content
-                markdown_content = result.markdown.raw_markdown
-                
-                # Generate filename from URL
-                filename = sanitize_filename(current_url)
-                output_path = os.path.join(output_dir, filename)
-                
-                # Save Markdown to file
-                with open(output_path, "w", encoding="utf-8") as f:
-                    f.write(f"# {current_url}\n\n{markdown_content}\n")
-                print(f"Saved Markdown to {output_path}")
-                
-                # Extract and crawl internal links
-                internal_links = result.links.get("internal", [])
-                for link in internal_links:
-                    href = link["href"]
-                    absolute_url = urljoin(current_url, href)
-                    if urlparse(absolute_url).netloc == urlparse(url).netloc:
-                        await crawl_page(absolute_url)
-            else:
-                print(f"Failed to crawl {current_url}: {result.error_message}")
-    
-    # Start crawling
-    await crawl_page(url)
-    
-    # Save metadata
-    with open(os.path.join(output_dir, "crawl_metadata.json"), "w", encoding="utf-8") as f:
+        print(f"Crawling ({len(visited_urls)}/{max_pages}): {current_url}")
+
+        async with semaphore:  # Control concurrency
+            async with AsyncWebCrawler(verbose=True) as crawler:
+                result = await crawler.arun(url=current_url, config=config)
+
+                if result.success:
+                    markdown_content = result.markdown.raw_markdown
+                    filename = sanitize_filename(current_url)
+                    output_path = os.path.join(output_dir, filename)
+
+                    with open(output_path, "w", encoding="utf-8") as f:
+                        f.write(f"# {current_url}\n\n{markdown_content}\n")
+                    print(f"Saved: {output_path}")
+
+                    internal_links = result.links.get("internal", [])
+                    for link in internal_links:
+                        href = link["href"]
+                        absolute_url = urljoin(current_url, href)
+                        if urlparse(absolute_url).netloc == urlparse(start_url).netloc:
+                            if absolute_url not in visited_urls:
+                                crawl_queue.put_nowait(absolute_url)
+                else:
+                    print(f"Failed to crawl {current_url}: {result.error_message}")
+
+    async def worker():
+        while len(visited_urls) < max_pages and not crawl_queue.empty():
+            current_url = await crawl_queue.get()
+            await crawl_page(current_url)
+            crawl_queue.task_done()
+
+    # Launch worker tasks
+    tasks = []
+    for _ in range(max_concurrency):
+        tasks.append(asyncio.create_task(worker()))
+
+    await crawl_queue.join()
+
+    for task in tasks:
+        task.cancel()
+
+    metadata_path = os.path.join(output_dir, "metadata.json")
+    with open(metadata_path, "w", encoding="utf-8") as f:
         json.dump({"crawled_urls": list(visited_urls)}, f, indent=2)
-    print(f"Metadata saved to {os.path.join(output_dir, 'crawl_metadata.json')}")
+    print(f"Metadata saved to {metadata_path}")
 
 async def main():
-    target_url = "https://youtube.com"
-    await crawl_website(target_url, output_dir="markdown_files", max_pages=10)
+    target_url = "https://www.musee-foliemarco.com"
+    output_dir = r"C:\Users\victo\Desktop\crawl\musee_foliemarco"
+    await crawl_website(
+        start_url=target_url,
+        output_dir=output_dir,
+        max_pages=100,
+        max_concurrency=5  # Number of parallel requests
+    )
 
 if __name__ == "__main__":
     asyncio.run(main())
