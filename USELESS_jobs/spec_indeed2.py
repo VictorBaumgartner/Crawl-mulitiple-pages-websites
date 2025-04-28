@@ -85,5 +85,5 @@ url = "https://fr.indeed.com/jobs?q=D%C3%A9veloppeur+Python&l=Paris&radius=35"
 jobs = fetch_indeed_jobs(url)
 
 # Save to JSON file
-with open(r"C:\Users\victo\Desktop\crawl\jobs.json", "w", encoding="utf-8") as f:
+with open("jobs.json", "w", encoding="utf-8") as f:
     json.dump(jobs, f, ensure_ascii=False, indent=4)
