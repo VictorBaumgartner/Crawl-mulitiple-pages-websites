@@ -10,6 +10,7 @@ from crawl4ai.markdown_generation_strategy import DefaultMarkdownGenerator
 import logging # Import logging
 
 # Configure basic logging
+# Logs will appear in your terminal when you run the FastAPI app with uvicorn
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
@@ -84,10 +85,7 @@ async def crawl_website(start_url, output_dir, max_concurrency=8):
     )
 
     visited_urls = set()
-    # queued_urls is no longer strictly needed as queue itself tracks state,
-    # but can be useful for quick checks before putting to avoid duplicates.
-    # However, checking visited_urls before putting is sufficient.
-    # Let's keep it for clarity, but ensure visited_urls is the primary check.
+    # queued_urls helps prevent adding the same URL multiple times before it's visited
     queued_urls = set()
 
     crawl_queue = asyncio.Queue()
@@ -122,8 +120,8 @@ async def crawl_website(start_url, output_dir, max_concurrency=8):
         # Add .md extension
         filename = f"{filename}.md"
 
-        # Truncate to a reasonable length
-        return filename[:250] # Increased slightly for more complex URLs
+        # Truncate to a reasonable length to avoid OS limits
+        return filename[:250]
 
 
     async def crawl_page(current_url):
@@ -131,6 +129,7 @@ async def crawl_website(start_url, output_dir, max_concurrency=8):
             logger.info(f"Skipping visited: {current_url}")
             return
 
+        # Add to visited *before* crawling to prevent other workers from adding it
         visited_urls.add(current_url)
         logger.info(f"Crawling ({len(visited_urls)} visited): {current_url}")
 
@@ -151,6 +150,7 @@ async def crawl_website(start_url, output_dir, max_concurrency=8):
 
                     try:
                         with open(output_path, "w", encoding="utf-8") as f:
+                            # Add original URL as a header for context
                             f.write(f"# {current_url}\n\n{cleaned_markdown}\n")
                         logger.info(f"Saved cleaned Markdown to: {output_path}")
                     except IOError as e:
@@ -158,7 +158,7 @@ async def crawl_website(start_url, output_dir, max_concurrency=8):
 
 
                     internal_links = result.links.get("internal", [])
-                    start_netloc = urlparse(start_url).netloc # Get netloc once
+                    start_netloc = urlparse(start_url).netloc # Get netloc once for comparison
 
                     for link in internal_links:
                         href = link.get("href")
@@ -171,28 +171,32 @@ async def crawl_website(start_url, output_dir, max_concurrency=8):
                         # Parse the absolute URL once
                         parsed_absolute_url = urlparse(absolute_url)
 
-                        # Simple check to avoid common non-content links
+                        # Simple checks to avoid common non-content links or fragments
                         if parsed_absolute_url.scheme not in ['http', 'https']:
                              logger.debug(f"Skipping non-http/https link: {absolute_url}")
                              continue
-                        if parsed_absolute_url.fragment and not parsed_absolute_url.path and not parsed_absolute_url.query:
-                             logger.debug(f"Skipping fragment-only link: {absolute_url}")
-                             continue # Skip fragment-only links on the same page
+                        # Skip fragment-only links on the same page, they don't add new content
+                        if parsed_absolute_url.fragment and not parsed_absolute_url.path and urlparse(current_url).path == parsed_absolute_url.path:
+                             logger.debug(f"Skipping fragment-only link on same page: {absolute_url}")
+                             continue
 
                         # Normalize URL: remove fragment for queuing, keep path/query
-                        normalized_url = urljoin(absolute_url, urlparse(absolute_url).path)
+                        normalized_url = urljoin(absolute_url, parsed_absolute_url.path)
                         if parsed_absolute_url.query:
                             normalized_url += "?" + parsed_absolute_url.query
 
 
                         # Check if it's on the same domain as the start URL
                         if parsed_absolute_url.netloc == start_netloc:
-                             # Check if already visited or queued *before* adding
+                            # Check if already visited or queued *before* adding
                             if normalized_url not in visited_urls and normalized_url not in queued_urls:
                                 logger.debug(f"Queueing new link: {normalized_url}")
                                 # Add to queued_urls set and put in queue
                                 queued_urls.add(normalized_url)
-                                await crawl_queue.put(normalized_url) # Use await put
+                                # Use await put - blocks if queue maxsize is reached, but default is infinite
+                                await crawl_queue.put(normalized_url)
+                            #else:
+                                #logger.debug(f"Already visited or queued: {normalized_url}")
 
 
                         else:
@@ -202,7 +206,8 @@ async def crawl_website(start_url, output_dir, max_concurrency=8):
                     logger.error(f"Failed to crawl {current_url}: {result.error_message}")
 
             except Exception as e:
-                logger.error(f"An error occurred while crawling {current_url}: {e}", exc_info=True) # Log exception details
+                # Catch any unexpected errors during page processing
+                logger.error(f"An error occurred while processing {current_url}: {e}", exc_info=True)
 
 
     async def worker():
@@ -210,48 +215,59 @@ async def crawl_website(start_url, output_dir, max_concurrency=8):
         while True: # Keep the worker running indefinitely until cancelled
             try:
                 # Get an item from the queue. This will block if the queue is empty.
-                current_url = await crawl_queue.get()
+                # The timeout is optional, but can help prevent workers from hanging forever
+                # in edge cases if the queue logic somehow gets stuck.
+                # For standard crawls, removing timeout is fine; join() handles completion.
+                current_url = await crawl_queue.get() # Removed timeout to rely solely on queue.join()
 
                 # Process the URL
                 await crawl_page(current_url)
 
             except asyncio.CancelledError:
                 # Task was cancelled, break the loop
-                logger.info("Worker received cancellation signal. Exiting.")
+                logger.info(f"Worker {asyncio.current_task().get_name()} received cancellation signal. Exiting.")
                 break
             except Exception as e:
                  # Catch unexpected errors in the worker loop itself
-                 logger.error(f"Unexpected error in worker: {e}", exc_info=True)
-                 # Continue loop or break? Breaking might prevent infinite errors. Let's break.
+                 logger.error(f"Unexpected error in worker {asyncio.current_task().get_name()}: {e}", exc_info=True)
+                 # Decide if you want the worker to stop on unexpected errors.
+                 # Breaking might prevent infinite error loops.
                  break
             finally:
                 # This is crucial: Indicate that the currently processed task is done.
                 # This is how queue.join() knows when all tasks are finished.
                 crawl_queue.task_done()
-                # Remove from queued_urls now that it's done processing (optional, but can help manage the set size)
-                # Note: Removing here might allow re-queueing if found again, be careful.
-                # Keeping in queued_urls or moving to visited_urls is safer.
-                # The current logic adds to visited_urls, which is better.
-                pass # task_done is the important part here
 
 
     # --- Main crawling orchestration ---
 
     # Add the starting URL to the queue and the set
-    if start_url not in queued_urls and start_url not in visited_urls:
-         logger.info(f"Adding initial URL to queue: {start_url}")
-         await crawl_queue.put(start_url)
-         queued_urls.add(start_url)
+    # Ensure it's not already queued/visited from a previous run if cache was used (not in this config)
+    # or if the same URL was somehow added via another path immediately.
+    normalized_start_url = urljoin(start_url, urlparse(start_url).path)
+    if urlparse(start_url).query:
+         normalized_start_url += "?" + urlparse(start_url).query
+
+    if normalized_start_url not in queued_urls and normalized_start_url not in visited_urls:
+         logger.info(f"Adding initial URL to queue: {normalized_start_url}")
+         await crawl_queue.put(normalized_start_url)
+         queued_urls.add(normalized_start_url)
+    else:
+         logger.info(f"Initial URL already queued or visited: {normalized_start_url}")
+
 
     # Create and start worker tasks
     tasks = []
     for i in range(max_concurrency):
-        task = asyncio.create_task(worker(), name=f"worker-{i}") # Give tasks names for easier debugging
+        # Give tasks names for easier debugging in logs
+        task = asyncio.create_task(worker(), name=f"worker-{i}")
         tasks.append(task)
-        logger.info(f"Started worker task {i}")
+        logger.info(f"Started worker task {task.get_name()}")
 
 
     # Wait for the queue to be empty and all tasks to call task_done()
+    # This will block until all initially added URLs and all subsequently added URLs
+    # by the workers have been retrieved from the queue and task_done() has been called.
     logger.info("Waiting for crawl queue to finish...")
     await crawl_queue.join()
     logger.info("Crawl queue is empty and all tasks are done.")
@@ -263,8 +279,14 @@ async def crawl_website(start_url, output_dir, max_concurrency=8):
 
     # Wait for the cancelled tasks to finish their cleanup (enter the except CancelledError block)
     # Using gather with return_exceptions=True handles potential errors during cancellation
-    await asyncio.gather(*tasks, return_exceptions=True)
-    logger.info("All worker tasks cancelled.")
+    # and prevents the program from stopping if a task raises an unhandled exception during cancellation.
+    try:
+        await asyncio.gather(*tasks, return_exceptions=True)
+        logger.info("All worker tasks confirmed cancelled.")
+    except Exception as e:
+         # This might catch exceptions from gather itself if return_exceptions=False,
+         # but with return_exceptions=True, it mostly ensures we don't crash here.
+         logger.error(f"Error while gathering tasks after cancellation: {e}")
 
 
     # Save metadata
@@ -272,6 +294,7 @@ async def crawl_website(start_url, output_dir, max_concurrency=8):
     try:
         with open(metadata_path, "w", encoding="utf-8") as f:
             # Save both visited and queued URLs for potential future reference
+            # queued_urls_at_end should ideally be empty if join() completed successfully
             json.dump({"crawled_urls": list(visited_urls), "queued_urls_at_end": list(queued_urls)}, f, indent=2)
         logger.info(f"Metadata saved to {metadata_path}")
     except IOError as e:
@@ -280,31 +303,41 @@ async def crawl_website(start_url, output_dir, max_concurrency=8):
 
 @app.post("/scrape")
 async def scrape_website(request: ScrapingRequest):
+    """
+    FastAPI endpoint to trigger the website scraping process.
+    Takes a URL and a folder name for output.
+    """
     logger.info(f"Received scraping request for URL: {request.url}, folder: {request.folder_name}")
     try:
         target_url = request.url
         folder_name = request.folder_name
-        output_dir = os.path.join("crawl_output", folder_name)
+        # Using 'crawl_output' as a base directory relative to where the script runs
+        output_dir = os.path.join("crawl_output", folder_name) # Changed base folder name back to 'crawl_output' as per initial structure
 
         # Basic URL validation
-        if not urlparse(target_url).scheme or not urlparse(target_url).netloc:
-             raise HTTPException(status_code=400, detail=f"Invalid URL format: {target_url}")
+        parsed_url = urlparse(target_url)
+        if not parsed_url.scheme or not parsed_url.netloc:
+             logger.warning(f"Invalid URL format received: {target_url}")
+             raise HTTPException(status_code=400, detail=f"Invalid URL format: {target_url}. Please provide a full URL including scheme (http/https).")
 
         # Start the scraping process
+        # The await here means the API endpoint will wait for the entire crawl to finish
         await crawl_website(start_url=target_url, output_dir=output_dir)
 
         logger.info(f"Scraping completed successfully for {target_url}")
-        return {"status": "success", "message": f"Scraping completed for {target_url}. Output in {output_dir}"}
+        return {"status": "success", "message": f"Scraping completed for {target_url}. Output saved to {output_dir}"}
     except HTTPException as http_exc:
-        # Re-raise HTTP exceptions directly
+        # Re-raise HTTP exceptions (like the 400 for invalid URL)
         raise http_exc
     except Exception as e:
+        # Catch any other unexpected errors, log them, and return a 500 error
         logger.error(f"An unhandled error occurred during scraping: {str(e)}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"An error occurred: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"An internal server error occurred: {str(e)}")
 
 
 if __name__ == "__main__":
     import uvicorn
-    # Uvicorn by default logs requests and startup information
+    # Uvicorn will handle the main event loop and run the FastAPI app.
+    # Uvicorn's output combined with the logging configured above will show the process.
     logger.info("Starting Uvicorn server...")
     uvicorn.run(app, host="0.0.0.0", port=8000)
