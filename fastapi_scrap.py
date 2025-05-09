@@ -312,7 +312,7 @@ async def scrape_website(request: ScrapingRequest):
         target_url = request.url
         folder_name = request.folder_name
         # Using 'crawl_output' as a base directory relative to where the script runs
-        output_dir = os.path.join("crawl_output", folder_name) # Changed base folder name back to 'crawl_output' as per initial structure
+        output_dir = os.path.join("crawl_output2", folder_name) # Changed base folder name back to 'crawl_output' as per initial structure
 
         # Basic URL validation
         parsed_url = urlparse(target_url)
