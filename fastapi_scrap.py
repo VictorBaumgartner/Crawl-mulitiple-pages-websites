@@ -7,6 +7,11 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from crawl4ai import AsyncWebCrawler, CrawlerRunConfig
 from crawl4ai.markdown_generation_strategy import DefaultMarkdownGenerator
+import logging # Import logging
+
+# Configure basic logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
 app = FastAPI()
 
@@ -25,36 +30,36 @@ def clean_markdown(md_text):
     """
     # Remove Markdown links but keep the text
     md_text = re.sub(r'\[([^\]]+)\]\((http[s]?://[^\)]+)\)', r'\1', md_text)
-    
+
     # Remove raw URLs
     md_text = re.sub(r'http[s]?://\S+', '', md_text)
-    
+
     # Remove images
     md_text = re.sub(r'!\[([^\]]*)\]\((http[s]?://[^\)]+)\)', '', md_text)
-    
+
     # Remove footnotes
     md_text = re.sub(r'\[\^?\d+\]', '', md_text)
     md_text = re.sub(r'^\[\^?\d+\]:\s?.*$', '', md_text, flags=re.MULTILINE)
-    
+
     # Remove blockquotes
     md_text = re.sub(r'^\s{0,3}>\s?', '', md_text, flags=re.MULTILINE)
-    
+
     # Remove bold and italic formatting (**bold**, *italic*, __underline__, _italic_)
     md_text = re.sub(r'(\*\*|__)(.*?)\1', r'\2', md_text)
     md_text = re.sub(r'(\*|_)(.*?)\1', r'\2', md_text)
-    
+
     # Remove empty headings (lines that are only '#', '##', etc.)
     md_text = re.sub(r'^\s*#+\s*$', '', md_text, flags=re.MULTILINE)
-    
-    # Remove leftover empty parentheses
+
+    # Remove leftover empty parentheses - risky, but keeping based on original code intent
     md_text = re.sub(r'\(\)', '', md_text)
-    
+
     # Compact multiple empty lines into one
     md_text = re.sub(r'\n\s*\n+', '\n\n', md_text)
-    
+
     # Clean extra spaces
     md_text = re.sub(r'[ \t]+', ' ', md_text)
-    
+
     return md_text.strip()
 
 
@@ -63,10 +68,9 @@ async def crawl_website(start_url, output_dir, max_concurrency=8):
     Crawl a website deeply and save each page as a cleaned Markdown file, with parallelization.
     """
     os.makedirs(output_dir, exist_ok=True)
-
     md_generator = DefaultMarkdownGenerator(
         options={
-            "ignore_links": True,  # Not important because we clean after
+            "ignore_links": True,  # Links are extracted separately, no need for them in Markdown
             "escape_html": True,
             "body_width": 0
         }
@@ -75,95 +79,232 @@ async def crawl_website(start_url, output_dir, max_concurrency=8):
     config = CrawlerRunConfig(
         markdown_generator=md_generator,
         cache_mode="BYPASS",
-        exclude_external_links=True,
+        exclude_external_links=True, # Important for staying within the domain
         exclude_social_media_links=True,
     )
 
     visited_urls = set()
+    # queued_urls is no longer strictly needed as queue itself tracks state,
+    # but can be useful for quick checks before putting to avoid duplicates.
+    # However, checking visited_urls before putting is sufficient.
+    # Let's keep it for clarity, but ensure visited_urls is the primary check.
     queued_urls = set()
+
     crawl_queue = asyncio.Queue()
-    crawl_queue.put_nowait(start_url)
     semaphore = asyncio.Semaphore(max_concurrency)
 
     def sanitize_filename(url):
         parsed = urlparse(url)
-        path = parsed.path.strip("/").replace("/", "_") or "index"
-        netloc = parsed.netloc.replace(".", "_")
-        filename = f"{netloc}_{path}.md"
+        # Use netloc and path to create a unique filename
+        netloc = parsed.netloc.replace(".", "_").replace(":", "_")
+        path = parsed.path.strip("/").replace("/", "_")
+        query = parsed.query.replace("=", "_").replace("&", "_")
+        fragment = parsed.fragment.replace("=", "_") # Often ignored for content, but can differentiate
+
+        filename_parts = [netloc]
+        if path:
+            filename_parts.append(path)
+        if query:
+             # Add a separator before query part
+             filename_parts.append(f"query_{query}")
+        if fragment:
+             # Add a separator before fragment part
+             filename_parts.append(f"fragment_{fragment}")
+
+        filename = "_".join(filename_parts) or "index" # Default to index if parts are empty
+
+        # Clean any remaining invalid characters
         filename = re.sub(r'[<>:"/\\|?*]', '_', filename)
-        return filename[:200]
+
+        # Ensure filename doesn't start or end with _ from sanitization
+        filename = filename.strip('_') or "index"
+
+        # Add .md extension
+        filename = f"{filename}.md"
+
+        # Truncate to a reasonable length
+        return filename[:250] # Increased slightly for more complex URLs
+
 
     async def crawl_page(current_url):
         if current_url in visited_urls:
+            logger.info(f"Skipping visited: {current_url}")
             return
 
         visited_urls.add(current_url)
-        print(f"Crawling ({len(visited_urls)}): {current_url}")
+        logger.info(f"Crawling ({len(visited_urls)} visited): {current_url}")
 
+        # Acquire semaphore before fetching/processing the page content
         async with semaphore:
-            async with AsyncWebCrawler(verbose=True) as crawler:
-                result = await crawler.arun(url=current_url, config=config)
+            try:
+                async with AsyncWebCrawler(verbose=True) as crawler: # verbose=True will add crawler logs
+                    result = await crawler.arun(url=current_url, config=config)
 
                 if result.success:
                     markdown_content = result.markdown.raw_markdown
-                    
-                    # ✅ Clean the Markdown before saving
+
+                    # Clean the Markdown before saving
                     cleaned_markdown = clean_markdown(markdown_content)
 
                     filename = sanitize_filename(current_url)
                     output_path = os.path.join(output_dir, filename)
 
-                    with open(output_path, "w", encoding="utf-8") as f:
-                        f.write(f"# {current_url}\n\n{cleaned_markdown}\n")
-                    print(f"Saved cleaned Markdown to: {output_path}")
+                    try:
+                        with open(output_path, "w", encoding="utf-8") as f:
+                            f.write(f"# {current_url}\n\n{cleaned_markdown}\n")
+                        logger.info(f"Saved cleaned Markdown to: {output_path}")
+                    except IOError as e:
+                        logger.error(f"Failed to save file {output_path}: {e}")
+
 
                     internal_links = result.links.get("internal", [])
+                    start_netloc = urlparse(start_url).netloc # Get netloc once
+
                     for link in internal_links:
-                        href = link["href"]
+                        href = link.get("href")
+                        if not href:
+                            continue # Skip links with no href
+
+                        # Construct absolute URL safely
                         absolute_url = urljoin(current_url, href)
-                        if urlparse(absolute_url).netloc == urlparse(start_url).netloc:
-                            if absolute_url not in visited_urls and absolute_url not in queued_urls:
-                                crawl_queue.put_nowait(absolute_url)
-                                queued_urls.add(absolute_url)
+
+                        # Parse the absolute URL once
+                        parsed_absolute_url = urlparse(absolute_url)
+
+                        # Simple check to avoid common non-content links
+                        if parsed_absolute_url.scheme not in ['http', 'https']:
+                             logger.debug(f"Skipping non-http/https link: {absolute_url}")
+                             continue
+                        if parsed_absolute_url.fragment and not parsed_absolute_url.path and not parsed_absolute_url.query:
+                             logger.debug(f"Skipping fragment-only link: {absolute_url}")
+                             continue # Skip fragment-only links on the same page
+
+                        # Normalize URL: remove fragment for queuing, keep path/query
+                        normalized_url = urljoin(absolute_url, urlparse(absolute_url).path)
+                        if parsed_absolute_url.query:
+                            normalized_url += "?" + parsed_absolute_url.query
+
+
+                        # Check if it's on the same domain as the start URL
+                        if parsed_absolute_url.netloc == start_netloc:
+                             # Check if already visited or queued *before* adding
+                            if normalized_url not in visited_urls and normalized_url not in queued_urls:
+                                logger.debug(f"Queueing new link: {normalized_url}")
+                                # Add to queued_urls set and put in queue
+                                queued_urls.add(normalized_url)
+                                await crawl_queue.put(normalized_url) # Use await put
+
+
+                        else:
+                            logger.debug(f"Skipping external link: {absolute_url} (domain: {parsed_absolute_url.netloc})")
+
                 else:
-                    print(f"Failed to crawl {current_url}: {result.error_message}")
+                    logger.error(f"Failed to crawl {current_url}: {result.error_message}")
+
+            except Exception as e:
+                logger.error(f"An error occurred while crawling {current_url}: {e}", exc_info=True) # Log exception details
+
 
     async def worker():
-        while not crawl_queue.empty():
-            current_url = await crawl_queue.get()
-            await crawl_page(current_url)
-            crawl_queue.task_done()
+        """Worker function to process URLs from the queue."""
+        while True: # Keep the worker running indefinitely until cancelled
+            try:
+                # Get an item from the queue. This will block if the queue is empty.
+                current_url = await crawl_queue.get()
 
+                # Process the URL
+                await crawl_page(current_url)
+
+            except asyncio.CancelledError:
+                # Task was cancelled, break the loop
+                logger.info("Worker received cancellation signal. Exiting.")
+                break
+            except Exception as e:
+                 # Catch unexpected errors in the worker loop itself
+                 logger.error(f"Unexpected error in worker: {e}", exc_info=True)
+                 # Continue loop or break? Breaking might prevent infinite errors. Let's break.
+                 break
+            finally:
+                # This is crucial: Indicate that the currently processed task is done.
+                # This is how queue.join() knows when all tasks are finished.
+                crawl_queue.task_done()
+                # Remove from queued_urls now that it's done processing (optional, but can help manage the set size)
+                # Note: Removing here might allow re-queueing if found again, be careful.
+                # Keeping in queued_urls or moving to visited_urls is safer.
+                # The current logic adds to visited_urls, which is better.
+                pass # task_done is the important part here
+
+
+    # --- Main crawling orchestration ---
+
+    # Add the starting URL to the queue and the set
+    if start_url not in queued_urls and start_url not in visited_urls:
+         logger.info(f"Adding initial URL to queue: {start_url}")
+         await crawl_queue.put(start_url)
+         queued_urls.add(start_url)
+
+    # Create and start worker tasks
     tasks = []
-    for _ in range(max_concurrency):
-        tasks.append(asyncio.create_task(worker()))
+    for i in range(max_concurrency):
+        task = asyncio.create_task(worker(), name=f"worker-{i}") # Give tasks names for easier debugging
+        tasks.append(task)
+        logger.info(f"Started worker task {i}")
 
+
+    # Wait for the queue to be empty and all tasks to call task_done()
+    logger.info("Waiting for crawl queue to finish...")
     await crawl_queue.join()
+    logger.info("Crawl queue is empty and all tasks are done.")
 
+    # Cancel worker tasks as they are likely blocked on queue.get()
+    logger.info("Cancelling worker tasks...")
     for task in tasks:
         task.cancel()
 
+    # Wait for the cancelled tasks to finish their cleanup (enter the except CancelledError block)
+    # Using gather with return_exceptions=True handles potential errors during cancellation
+    await asyncio.gather(*tasks, return_exceptions=True)
+    logger.info("All worker tasks cancelled.")
+
+
+    # Save metadata
     metadata_path = os.path.join(output_dir, "metadata.json")
-    with open(metadata_path, "w", encoding="utf-8") as f:
-        json.dump({"crawled_urls": list(visited_urls)}, f, indent=2)
-    print(f"Metadata saved to {metadata_path}")
+    try:
+        with open(metadata_path, "w", encoding="utf-8") as f:
+            # Save both visited and queued URLs for potential future reference
+            json.dump({"crawled_urls": list(visited_urls), "queued_urls_at_end": list(queued_urls)}, f, indent=2)
+        logger.info(f"Metadata saved to {metadata_path}")
+    except IOError as e:
+         logger.error(f"Failed to save metadata file {metadata_path}: {e}")
 
 
 @app.post("/scrape")
 async def scrape_website(request: ScrapingRequest):
+    logger.info(f"Received scraping request for URL: {request.url}, folder: {request.folder_name}")
     try:
         target_url = request.url
         folder_name = request.folder_name
         output_dir = os.path.join("crawl_output", folder_name)
 
+        # Basic URL validation
+        if not urlparse(target_url).scheme or not urlparse(target_url).netloc:
+             raise HTTPException(status_code=400, detail=f"Invalid URL format: {target_url}")
+
         # Start the scraping process
         await crawl_website(start_url=target_url, output_dir=output_dir)
 
-        return {"status": "success", "message": f"Scraping completed for {target_url}"}
+        logger.info(f"Scraping completed successfully for {target_url}")
+        return {"status": "success", "message": f"Scraping completed for {target_url}. Output in {output_dir}"}
+    except HTTPException as http_exc:
+        # Re-raise HTTP exceptions directly
+        raise http_exc
     except Exception as e:
+        logger.error(f"An unhandled error occurred during scraping: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"An error occurred: {str(e)}")
 
 
 if __name__ == "__main__":
     import uvicorn
+    # Uvicorn by default logs requests and startup information
+    logger.info("Starting Uvicorn server...")
     uvicorn.run(app, host="0.0.0.0", port=8000)
