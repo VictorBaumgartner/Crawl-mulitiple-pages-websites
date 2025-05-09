@@ -48,8 +48,7 @@ def clean_markdown(md_text):
     
     return md_text.strip()
 
-
-async def crawl_website(start_url, output_dir=r"C:\Users\victo\Desktop\crawl\crawl_output", max_concurrency=5):
+async def crawl_website(start_url, output_dir=r"C:\Users\victo\Desktop\crawl\crawl_output", max_concurrency=8):
     """
     Crawl a website deeply and save each page as a cleaned Markdown file, with parallelization.
     """
@@ -143,12 +142,12 @@ async def crawl_website(start_url, output_dir=r"C:\Users\victo\Desktop\crawl\cra
     print(f"Metadata saved to {metadata_path}")
 
 async def main():
-    target_url = "https://www.musee-foliemarco.com"
-    output_dir = r"C:\Users\victo\Desktop\crawl\crawl_output\musee-foliemarco"
+    target_url = "https://www.rambolitrain.com/"
+    output_dir = r"C:\Users\victo\Desktop\crawl\crawl_output2\rambolitrain"
     await crawl_website(
         start_url=target_url,
         output_dir=output_dir,
-        max_concurrency=5
+        max_concurrency=20
     )
 
 if __name__ == "__main__":
