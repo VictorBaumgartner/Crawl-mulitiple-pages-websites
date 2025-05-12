@@ -6,6 +6,7 @@ from collections import deque
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 from urllib.parse import urljoin, urlparse
+import json
 
 import httpx
 from bs4 import BeautifulSoup
@@ -23,10 +24,6 @@ app = FastAPI(
     description="An API to crawl websites, retrieve markdown for every page, and save them to a specified folder.",
     version="1.0.0"
 )
-
-# Removed the global output_base_dir definition here.
-# It will now be determined dynamically based on the request payload or a default.
-
 
 # --- Markdown Cleaning Function ---
 def clean_markdown(md_text: str) -> str:
@@ -253,6 +250,21 @@ class CustomWebCrawler:
             # Wait for any remaining active tasks to complete gracefully
             await asyncio.gather(*active_workers, return_exceptions=True)
 
+        # Save metadata.json with crawled URLs
+        try:
+            metadata = {"crawled_urls": [result['url'] for result in self.crawled_results]}
+            metadata_file_path = self.output_dir / "metadata.json"
+            with open(metadata_file_path, "w", encoding="utf-8") as f:
+                json.dump(metadata, f, ensure_ascii=False, indent=4)
+            logger.info(f"Saved metadata to {metadata_file_path}")
+        except IOError as e:
+            error_msg = f"Failed to save metadata.json to {metadata_file_path}: {e}"
+            logger.error(error_msg, exc_info=True)
+            self.errors.append(error_msg)
+        except Exception as e:
+            error_msg = f"Unexpected error saving metadata.json to {metadata_file_path}: {e}"
+            logger.error(error_msg, exc_info=True)
+            self.errors.append(error_msg)
 
         return len(self.crawled_results), saved_files_paths
 
@@ -323,26 +335,3 @@ async def crawl_all_markdowns(request: CrawlRequest):
             status_code=500,
             detail=f"An internal server error occurred during crawl setup: {str(e)}"
         )
-
-# --- How to Run This Application ---
-# 1. Save the code: Save the code above as `main.py` in your project directory.
-# 2. Install dependencies:
-#    pip install "fastapi[all]" uvicorn httpx beautifulsoup4 html2text
-# 3. Run the FastAPI application using Uvicorn:
-#    uvicorn main:app --host 0.0.0.0 --port 8000 --workers 1
-#    (Ensure your user has write access to the chosen output directory or the script's directory if using the default.)
-
-# --- Example Usage with curl (from another terminal) ---
-# To crawl a website and save cleaned markdowns to a SPECIFIC directory:
-# curl -X POST "http://localhost:8000/crawl_all_markdowns" \
-#      -H "Content-Type: application/json" \
-#      -d '{"url": "http://quotes.toscrape.com/", "max_pages": 20, "output_directory": "/tmp/quotes_markdowns"}'
-
-# To crawl a website and save cleaned markdowns to the DEFAULT directory (script's folder/crawl_output2):
-# curl -X POST "http://localhost:8000/crawl_all_markdowns" \
-#      -H "Content-Type: application/json" \
-#      -d '{"url": "https://www.datacamp.com/blog/", "max_pages": 50}'
-
-# --- API Documentation ---
-# Once the server is running, you can access the interactive API documentation
-# (Swagger UI) in your web browser at: http://localhost:8000/docs
