@@ -1,10 +1,11 @@
 import logging
-from fastapi import FastAPI, BackgroundTasks
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 import asyncio
 import os
 import json
 import re
+import argparse
 from urllib.parse import urljoin, urlparse
 from crawl4ai import AsyncWebCrawler, CrawlerRunConfig
 from crawl4ai.markdown_generation_strategy import DefaultMarkdownGenerator
@@ -37,6 +38,7 @@ def clean_markdown(md_text):
 async def crawl_website(start_url, output_dir="crawl_output", max_concurrency=8):
     """
     Crawl a website deeply and save each page as a cleaned Markdown file, with parallelization.
+    Returns the number of crawled URLs or raises an exception on failure.
     """
     logger.info(f"Starting crawl for {start_url} with output_dir {output_dir} and max_concurrency {max_concurrency}")
     
@@ -45,7 +47,7 @@ async def crawl_website(start_url, output_dir="crawl_output", max_concurrency=8)
         logger.info(f"Output directory ensured: {output_dir}")
     except Exception as e:
         logger.error(f"Failed to create output directory {output_dir}: {e}")
-        return
+        raise HTTPException(status_code=500, detail=f"Failed to create output directory: {e}")
 
     md_generator = DefaultMarkdownGenerator(
         options={
@@ -101,6 +103,7 @@ async def crawl_website(start_url, output_dir="crawl_output", max_concurrency=8)
                             logger.info(f"Saved cleaned Markdown to: {output_path}")
                         except Exception as e:
                             logger.error(f"Error saving file {output_path}: {e}")
+                            raise HTTPException(status_code=500, detail=f"Error saving file {output_path}: {e}")
 
                         internal_links = result.links.get("internal", [])
                         logger.info(f"Found {len(internal_links)} internal links on {current_url}")
@@ -115,6 +118,7 @@ async def crawl_website(start_url, output_dir="crawl_output", max_concurrency=8)
                         logger.warning(f"Failed to crawl {current_url}: {result.error_message}")
                 except Exception as e:
                     logger.error(f"Exception during crawling {current_url}: {e}")
+                    raise HTTPException(status_code=500, detail=f"Error crawling {current_url}: {e}")
 
     async def worker():
         while not crawl_queue.empty():
@@ -140,14 +144,77 @@ async def crawl_website(start_url, output_dir="crawl_output", max_concurrency=8)
         logger.info(f"Metadata saved to {metadata_path}")
     except Exception as e:
         logger.error(f"Error saving metadata {metadata_path}: {e}")
+        raise HTTPException(status_code=500, detail=f"Error saving metadata: {e}")
+
+    return len(visited_urls)
 
 class CrawlRequest(BaseModel):
     start_url: str
     output_dir: str = "crawl_output"
     max_concurrency: int = 8
 
-@app.post("/crawl")
-async def start_crawl(request: CrawlRequest, background_tasks: BackgroundTasks):
+class CrawlResponse(BaseModel):
+    message: str
+    pages_crawled: int
+    output_dir: str
+
+@app.post("/crawl", response_model=CrawlResponse)
+async def start_crawl(request: CrawlRequest):
     logger.info(f"Received crawl request for {request.start_url}")
-    background_tasks.add_task(crawl_website, request.start_url, request.output_dir, request.max_concurrency)
-    return {"message": f"Crawling started in the background. Results will be saved to {request.output_dir}"}
+    
+    # Basic URL validation
+    if not re.match(r'^https?://', request.start_url):
+        logger.error(f"Invalid URL: {request.start_url}")
+        raise HTTPException(status_code=400, detail="Invalid URL: Must start with http:// or https://")
+
+    try:
+        pages_crawled = await crawl_website(request.start_url, request.output_dir, request.max_concurrency)
+        logger.info(f"Crawl completed for {request.start_url}: {pages_crawled} pages crawled")
+        return CrawlResponse(
+            message="Crawl completed successfully",
+            pages_crawled=pages_crawled,
+            output_dir=request.output_dir
+        )
+    except HTTPException as e:
+        raise e
+    except Exception as e:
+        logger.error(f"Crawl failed for {request.start_url}: {e}")
+        raise HTTPException(status_code=500, detail=f"Crawl failed: {e}")
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Run a website crawler standalone")
+    parser.add_argument("--start_url", default="https://example.com", help="Starting URL for the crawl")
+    parser.add_argument("--output_dir", default="crawl_output", help="Directory to save crawled files")
+    parser.add_argument("--max_concurrency", type=int, default=8, help="Maximum number of concurrent crawlers")
+    args = parser.parse_args()
+
+    async def main():
+        # Create a CrawlRequest object for validation
+        try:
+            request = CrawlRequest(
+                start_url=args.start_url,
+                output_dir=args.output_dir,
+                max_concurrency=args.max_concurrency
+            )
+        except ValueError as e:
+            logger.error(f"Invalid input: {e}")
+            return
+
+        logger.info(f"Starting standalone crawl with input: {request.dict()}")
+
+        try:
+            pages_crawled = await crawl_website(
+                start_url=request.start_url,
+                output_dir=request.output_dir,
+                max_concurrency=request.max_concurrency
+            )
+            response = CrawlResponse(
+                message="Crawl completed successfully",
+                pages_crawled=pages_crawled,
+                output_dir=request.output_dir
+            )
+            logger.info(f"Standalone crawl output: {json.dumps(response.dict(), indent=2)}")
+        except Exception as e:
+            logger.error(f"Standalone crawl failed: {e}")
+
+    asyncio.run(main())
