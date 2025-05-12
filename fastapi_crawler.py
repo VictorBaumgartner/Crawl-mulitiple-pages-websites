@@ -6,12 +6,13 @@ import os
 import json
 import re
 import argparse
+import time
 from urllib.parse import urljoin, urlparse
 from crawl4ai import AsyncWebCrawler, CrawlerRunConfig
 from crawl4ai.markdown_generation_strategy import DefaultMarkdownGenerator
 
 # Configure logging
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 app = FastAPI()
@@ -40,6 +41,7 @@ async def crawl_website(start_url, output_dir="crawl_output", max_concurrency=8)
     Crawl a website deeply and save each page as a cleaned Markdown file, with parallelization.
     Returns the number of crawled URLs or raises an exception on failure.
     """
+    start_time = time.time()
     logger.info(f"Starting crawl for {start_url} with output_dir {output_dir} and max_concurrency {max_concurrency}")
     
     try:
@@ -62,12 +64,16 @@ async def crawl_website(start_url, output_dir="crawl_output", max_concurrency=8)
         cache_mode="BYPASS",
         exclude_external_links=True,
         exclude_social_media_links=True,
+        bypass_cache=True,
+        max_depth=None,  # No depth limit for deep crawling
+        use_playwright=True,  # Enable JavaScript rendering
     )
 
     visited_urls = set()
     queued_urls = set()
     crawl_queue = asyncio.Queue()
     crawl_queue.put_nowait(start_url)
+    queued_urls.add(start_url)
     logger.info(f"Queue initialized with start_url: {start_url}")
     semaphore = asyncio.Semaphore(max_concurrency)
 
@@ -84,7 +90,7 @@ async def crawl_website(start_url, output_dir="crawl_output", max_concurrency=8)
             return
 
         visited_urls.add(current_url)
-        logger.info(f"Crawling ({len(visited_urls)}): {current_url}")
+        logger.info(f"Crawling ({len(visited_urls)}/{len(queued_urls) + len(visited_urls)}): {current_url}")
 
         async with semaphore:
             async with AsyncWebCrawler(verbose=True) as crawler:
@@ -110,21 +116,26 @@ async def crawl_website(start_url, output_dir="crawl_output", max_concurrency=8)
                         for link in internal_links:
                             href = link["href"]
                             absolute_url = urljoin(current_url, href)
-                            if urlparse(absolute_url).netloc == urlparse(start_url).netloc:
+                            parsed_absolute = urlparse(absolute_url)
+                            parsed_start = urlparse(start_url)
+                            if parsed_absolute.netloc == parsed_start.netloc:
                                 if absolute_url not in visited_urls and absolute_url not in queued_urls:
                                     crawl_queue.put_nowait(absolute_url)
                                     queued_urls.add(absolute_url)
+                                    logger.debug(f"Added to queue: {absolute_url}")
                     else:
                         logger.warning(f"Failed to crawl {current_url}: {result.error_message}")
                 except Exception as e:
                     logger.error(f"Exception during crawling {current_url}: {e}")
-                    raise HTTPException(status_code=500, detail=f"Error crawling {current_url}: {e}")
+                    # Continue crawling other pages instead of failing
+                    return
 
     async def worker():
         while not crawl_queue.empty():
             current_url = await crawl_queue.get()
             await crawl_page(current_url)
             crawl_queue.task_done()
+            logger.debug(f"Queue size: {crawl_queue.qsize()}, Visited: {len(visited_urls)}, Queued: {len(queued_urls)}")
 
     tasks = []
     for _ in range(max_concurrency):
@@ -146,6 +157,8 @@ async def crawl_website(start_url, output_dir="crawl_output", max_concurrency=8)
         logger.error(f"Error saving metadata {metadata_path}: {e}")
         raise HTTPException(status_code=500, detail=f"Error saving metadata: {e}")
 
+    elapsed_time = time.time() - start_time
+    logger.info(f"Crawl completed in {elapsed_time:.2f} seconds: {len(visited_urls)} pages crawled")
     return len(visited_urls)
 
 class CrawlRequest(BaseModel):
@@ -157,6 +170,7 @@ class CrawlResponse(BaseModel):
     message: str
     pages_crawled: int
     output_dir: str
+    elapsed_time: float
 
 @app.post("/crawl", response_model=CrawlResponse)
 async def start_crawl(request: CrawlRequest):
@@ -167,13 +181,16 @@ async def start_crawl(request: CrawlRequest):
         logger.error(f"Invalid URL: {request.start_url}")
         raise HTTPException(status_code=400, detail="Invalid URL: Must start with http:// or https://")
 
+    start_time = time.time()
     try:
         pages_crawled = await crawl_website(request.start_url, request.output_dir, request.max_concurrency)
-        logger.info(f"Crawl completed for {request.start_url}: {pages_crawled} pages crawled")
+        elapsed_time = time.time() - start_time
+        logger.info(f"Crawl completed for {request.start_url}: {pages_crawled} pages crawled in {elapsed_time:.2f} seconds")
         return CrawlResponse(
             message="Crawl completed successfully",
             pages_crawled=pages_crawled,
-            output_dir=request.output_dir
+            output_dir=request.output_dir,
+            elapsed_time=elapsed_time
         )
     except HTTPException as e:
         raise e
@@ -183,7 +200,7 @@ async def start_crawl(request: CrawlRequest):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run a website crawler standalone")
-    parser.add_argument("--start_url", default="https://example.com", help="Starting URL for the crawl")
+    parser.add_argument("--start_url", default="https://www.wikipedia.org", help="Starting URL for the crawl")
     parser.add_argument("--output_dir", default="crawl_output", help="Directory to save crawled files")
     parser.add_argument("--max_concurrency", type=int, default=8, help="Maximum number of concurrent crawlers")
     args = parser.parse_args()
@@ -194,7 +211,7 @@ if __name__ == "__main__":
             request = CrawlRequest(
                 start_url=args.start_url,
                 output_dir=args.output_dir,
-                max_concurrency=args.max_concurrency
+                max_conspiracy=args.max_concurrency
             )
         except ValueError as e:
             logger.error(f"Invalid input: {e}")
@@ -202,16 +219,19 @@ if __name__ == "__main__":
 
         logger.info(f"Starting standalone crawl with input: {request.dict()}")
 
+        start_time = time.time()
         try:
             pages_crawled = await crawl_website(
                 start_url=request.start_url,
                 output_dir=request.output_dir,
                 max_concurrency=request.max_concurrency
             )
+            elapsed_time = time.time() - start_time
             response = CrawlResponse(
                 message="Crawl completed successfully",
                 pages_crawled=pages_crawled,
-                output_dir=request.output_dir
+                output_dir=request.output_dir,
+                elapsed_time=elapsed_time
             )
             logger.info(f"Standalone crawl output: {json.dumps(response.dict(), indent=2)}")
         except Exception as e:
