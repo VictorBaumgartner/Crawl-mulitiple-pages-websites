@@ -1,7 +1,7 @@
 import asyncio
 import logging
 import os
-import re # Import the 're' module for regular expressions
+import re
 from collections import deque
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
@@ -24,12 +24,8 @@ app = FastAPI(
     version="1.0.0"
 )
 
-# --- Output Directory Configuration ---
-# This will create the 'crawl_output2' folder directly within the directory
-# where your 'main.py' script is located.
-# Assuming main.py is in 'Crawl-mulitiple-pages-websites/',
-# the output will be in /Users/victor/Documents/cs/Crawl-mulitiple-pages-websites/crawl_output2/
-output_base_dir = Path(__file__).parent / "crawl_output2"
+# Removed the global output_base_dir definition here.
+# It will now be determined dynamically based on the request payload or a default.
 
 
 # --- Markdown Cleaning Function ---
@@ -83,6 +79,14 @@ class CrawlRequest(BaseModel):
     url: HttpUrl = Field(..., example="https://books.toscrape.com/") # The starting URL for the crawl
     max_pages: int = Field(3000, ge=1, example=100)  # Maximum number of pages to crawl.
     concurrency_limit: int = Field(8, ge=1, le=50, example=8) # Number of parallel requests
+    # New: Optional output directory in the payload
+    output_directory: Optional[str] = Field(
+        None,
+        example="my_crawl_results",
+        description="Optional. The path to the directory where markdown files will be saved. "
+                    "Can be absolute (e.g., /Users/victor/my_output) or relative (e.g., my_results_folder). "
+                    "If not provided, defaults to 'crawl_output2' within the script's directory."
+    )
 
 class CrawlResponse(BaseModel):
     """
@@ -104,7 +108,7 @@ class CustomWebCrawler:
         self.visited_urls: Set[str] = set()
         self.to_visit_queue: deque[str] = deque([start_url])
         self.semaphore = asyncio.Semaphore(self.concurrency_limit)
-        self.crawled_results: List[Dict[str, str]] = [] # Stores {'url': 'markdown'}
+        self.crawled_results: List[Dict[str, str]] = []
         self.errors: List[str] = []
         self.html_to_markdown = html2text.HTML2Text()
         self.html_to_markdown.ignore_links = False
@@ -117,7 +121,6 @@ class CustomWebCrawler:
                 logger.info(f"Fetching: {url}")
                 response = await client.get(url, follow_redirects=True, timeout=30)
                 response.raise_for_status()
-                # Only add to visited_urls after a successful fetch to allow retries if needed
                 self.visited_urls.add(url)
                 return response.text
         except httpx.RequestError as exc:
@@ -136,18 +139,14 @@ class CustomWebCrawler:
         links = set()
         for a_tag in soup.find_all('a', href=True):
             href = a_tag['href']
-            # Resolve relative URLs to absolute URLs
             abs_url = urljoin(base_url, href)
-            # Only consider links within the same domain as the start_url
             if urlparse(abs_url).netloc == urlparse(self.start_url).netloc:
-                # Basic sanitization to remove fragments (#section-id)
                 parsed_abs_url = urlparse(abs_url)
                 cleaned_url = parsed_abs_url._replace(fragment="").geturl()
                 links.add(cleaned_url)
         return links
 
     def _html_to_markdown(self, html_content: str) -> str:
-        # html2text converts HTML to Markdown
         return self.html_to_markdown.handle(html_content)
 
     def _sanitize_filename(self, url: str) -> str:
@@ -155,14 +154,11 @@ class CustomWebCrawler:
         Sanitizes a URL to create a valid filename.
         Replaces invalid characters with underscores.
         """
-        # Remove scheme (http/https) and common prefixes like www.
         cleaned_url = re.sub(r'^(https?://)?(www\.)?', '', url)
-        # Replace invalid characters with underscores
         sanitized_name = re.sub(r'[^a-zA-Z0-9_.-]', '_', cleaned_url)
-        # Ensure it's not too long for filesystem limits (common limit ~255 chars)
         max_filename_len = 200
         if len(sanitized_name) > max_filename_len:
-            hash_suffix = str(abs(hash(url)))[:8] # Use a short hash for uniqueness
+            hash_suffix = str(abs(hash(url)))[:8]
             sanitized_name = sanitized_name[:max_filename_len - len(hash_suffix) - 1] + "_" + hash_suffix
         return sanitized_name + ".md"
 
@@ -178,20 +174,25 @@ class CustomWebCrawler:
             error_msg = f"Failed to create output directory {self.output_dir}: {e}"
             logger.error(error_msg, exc_info=True)
             self.errors.append(error_msg)
-            return 0, [] # Return 0 pages crawled and empty list if directory creation fails
+            return 0, []
 
-        # Use httpx.AsyncClient for session management and connection pooling
         async with httpx.AsyncClient() as client:
             tasks = deque()
-            initial_url = self.to_visit_queue.popleft() # Get the first URL from the queue
+            
+            # Pre-seed the queue with the initial URL
+            initial_url = str(self.start_url) # Ensure it's a string
+            if initial_url not in self.visited_urls:
+                 self.to_visit_queue.append(initial_url)
 
-            # Start the crawl with the initial URL
-            # This function will be called as long as there are URLs in the queue
-            # and max_pages hasn't been reached.
-            async def _worker():
+
+            async def _worker_task_logic():
                 while self.to_visit_queue and len(self.crawled_results) < self.max_pages:
-                    current_url = self.to_visit_queue.popleft()
-                    
+                    current_url = None
+                    try:
+                        current_url = self.to_visit_queue.popleft()
+                    except IndexError: # Queue is empty
+                        break
+
                     if current_url in self.visited_urls:
                         continue
                     
@@ -226,33 +227,31 @@ class CustomWebCrawler:
                         for link in new_links:
                             if link not in self.visited_urls and link not in self.to_visit_queue:
                                 self.to_visit_queue.append(link)
-
-            # Pre-seed the queue with the initial URL for the worker to pick up
-            # This is important if the queue can be empty when workers start.
-            if initial_url not in self.visited_urls:
-                 self.to_visit_queue.append(initial_url)
-
-            # Create and run worker tasks
-            workers = [asyncio.create_task(_worker()) for _ in range(self.concurrency_limit)]
             
-            # Continuously add tasks until the queue is exhausted or max_pages is reached
-            # This is a simplified way to manage the crawl loop.
-            # More robust crawlers would use a shared queue and cancellation tokens.
-            while len(self.crawled_results) < self.max_pages and (self.to_visit_queue or any(not t.done() for t in workers)):
+            # This is a more robust way to manage worker tasks for a crawler.
+            # It ensures that new tasks are continuously spawned as long as
+            # there are URLs to visit and the max_pages limit hasn't been reached.
+            active_workers = [
+                asyncio.create_task(_worker_task_logic()) 
+                for _ in range(self.concurrency_limit)
+            ]
+
+            # Keep adding new workers if necessary and manage existing ones
+            while self.to_visit_queue and len(self.crawled_results) < self.max_pages:
+                # Clean up finished workers
+                active_workers = [worker for worker in active_workers if not worker.done()]
+                
+                # Spawn new workers up to the concurrency limit
+                while len(active_workers) < self.concurrency_limit and self.to_visit_queue:
+                    active_workers.append(asyncio.create_task(_worker_task_logic()))
+                
+                if not active_workers and self.to_visit_queue: # All workers done, but queue still has items (shouldn't happen often)
+                    break # Exit to prevent infinite loop if workers get stuck
+
                 await asyncio.sleep(0.1) # Give time for tasks to run
-                # Remove completed tasks and add new ones if needed
-                # This loop logic is simplified for illustration, a proper queue with cancellation
-                # and graceful shutdown would be more complex.
-                workers = [t for t in workers if not t.done()]
-                while len(workers) < self.concurrency_limit and self.to_visit_queue and len(self.crawled_results) < self.max_pages:
-                    workers.append(asyncio.create_task(_worker()))
-                if not workers and self.to_visit_queue and len(self.crawled_results) < self.max_pages:
-                     # All workers finished but queue still has items, this shouldn't happen with above logic
-                     # but helps break infinite loop if tasks are stuck.
-                     break 
-            
-            # Wait for any remaining active tasks to complete
-            await asyncio.gather(*workers, return_exceptions=True) # Allow tasks to finish or fail
+
+            # Wait for any remaining active tasks to complete gracefully
+            await asyncio.gather(*active_workers, return_exceptions=True)
 
 
         return len(self.crawled_results), saved_files_paths
@@ -263,15 +262,29 @@ async def crawl_all_markdowns(request: CrawlRequest):
     """
     Crawls a website, retrieves markdown content for every page (up to max_pages),
     and saves each page's CLEANED markdown to the specified output directory.
+
+    The output directory can be specified in the payload. If not, it defaults
+    to a 'crawl_output2' folder in the same directory as the script.
     """
     logger.info(f"Received request to crawl all markdowns for URL: {request.url}, max_pages: {request.max_pages}")
 
-    # Initialize the custom web crawler
+    # Determine the output directory based on the request payload
+    if request.output_directory:
+        # User provided a path, use it directly. Convert to Path object and resolve to absolute path.
+        # This handles both absolute and relative paths provided by the user.
+        final_output_dir = Path(request.output_directory).resolve()
+    else:
+        # No output directory specified in payload, use the script's parent directory + default name
+        final_output_dir = Path(__file__).parent / "crawl_output2"
+
+    logger.info(f"Output directory for this crawl: {final_output_dir}")
+
+    # Initialize the custom web crawler with the determined output_dir
     crawler = CustomWebCrawler(
         start_url=str(request.url),
         max_pages=request.max_pages,
         concurrency_limit=request.concurrency_limit,
-        output_dir=output_base_dir
+        output_dir=final_output_dir # Pass the resolved output directory
     )
 
     try:
@@ -317,19 +330,18 @@ async def crawl_all_markdowns(request: CrawlRequest):
 #    pip install "fastapi[all]" uvicorn httpx beautifulsoup4 html2text
 # 3. Run the FastAPI application using Uvicorn:
 #    uvicorn main:app --host 0.0.0.0 --port 8000 --workers 1
-#    (If you are on a system where permissions are still an issue, ensure your user has
-#     write access to the directory where your main.py script is located.)
+#    (Ensure your user has write access to the chosen output directory or the script's directory if using the default.)
 
 # --- Example Usage with curl (from another terminal) ---
-# To crawl a website (e.g., a documentation site or blog) and save all page markdowns:
+# To crawl a website and save cleaned markdowns to a SPECIFIC directory:
+# curl -X POST "http://localhost:8000/crawl_all_markdowns" \
+#      -H "Content-Type: application/json" \
+#      -d '{"url": "http://quotes.toscrape.com/", "max_pages": 20, "output_directory": "/tmp/quotes_markdowns"}'
+
+# To crawl a website and save cleaned markdowns to the DEFAULT directory (script's folder/crawl_output2):
 # curl -X POST "http://localhost:8000/crawl_all_markdowns" \
 #      -H "Content-Type: application/json" \
 #      -d '{"url": "https://www.datacamp.com/blog/", "max_pages": 50}'
-
-# For a local example:
-# curl -X POST "http://localhost:8000/crawl_all_markdowns" \
-#      -H "Content-Type: application/json" \
-#      -d '{"url": "http://quotes.toscrape.com/", "max_pages": 20}'
 
 # --- API Documentation ---
 # Once the server is running, you can access the interactive API documentation
