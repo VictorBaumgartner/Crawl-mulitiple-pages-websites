@@ -1,9 +1,9 @@
 import asyncio
 import logging
 import os
-import re
+import re # Import the 're' module for regular expressions
 from collections import deque
-from pathlib import Path # Make sure Path is imported
+from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 from urllib.parse import urljoin, urlparse
 
@@ -25,9 +25,56 @@ app = FastAPI(
 )
 
 # --- Output Directory Configuration ---
-# This will create the 'crawl_output2' folder inside your user's home directory on macOS
-# (e.g., /Users/yourusername/crawl_output2/). This is a highly recommended and user-writable location.
-output_base_dir = Path.home() / "crawl_output2"
+# This will create the 'crawl_output2' folder directly within the directory
+# where your 'main.py' script is located.
+# Assuming main.py is in 'Crawl-mulitiple-pages-websites/',
+# the output will be in /Users/victor/Documents/cs/Crawl-mulitiple-pages-websites/crawl_output2/
+output_base_dir = Path(__file__).parent / "crawl_output2"
+
+
+# --- Markdown Cleaning Function ---
+def clean_markdown(md_text: str) -> str:
+    """
+    Cleans Markdown content by removing inline links, footnotes, URLs, images,
+    bold/italic formatting, blockquotes, empty headings, and compacting whitespace.
+    """
+    # Remove inline links (e.g., [text](url)) and keep only the text
+    md_text = re.sub(r'\[([^\]]+)\]\((http[s]?://[^\)]+)\)', r'\1', md_text)
+    
+    # Remove standalone URLs (not part of a link)
+    md_text = re.sub(r'http[s]?://\S+', '', md_text)
+    
+    # Remove images (e.g., ![alt text](url))
+    md_text = re.sub(r'!\[([^\]]*)\]\((http[s]?://[^\)]+)\)', '', md_text)
+    
+    # Remove footnote references (e.g., [^1])
+    md_text = re.sub(r'\[\^?\d+\]', '', md_text)
+    
+    # Remove footnote definitions (e.g., [^1]: some text) at the start of a line
+    md_text = re.sub(r'^\s*\[\^?\d+\]:\s?.*$', '', md_text, flags=re.MULTILINE)
+    
+    # Remove blockquotes (lines starting with > )
+    md_text = re.sub(r'^\s{0,3}>\s?', '', md_text, flags=re.MULTILINE)
+    
+    # Remove bold/italic formatting (e.g., **text** or _text_)
+    md_text = re.sub(r'(\*\*|__)(.*?)\1', r'\2', md_text) # Bold
+    md_text = re.sub(r'(\*|_)(.*?)\1', r'\2', md_text)   # Italic
+    
+    # Remove empty headings (e.g., lines that are just '##' or '###')
+    md_text = re.sub(r'^\s*#+\s*$', '', md_text, flags=re.MULTILINE)
+    
+    # Remove empty parentheses sometimes left after URL removal
+    md_text = re.sub(r'\(\)', '', md_text)
+    
+    # Compact multiple newlines into at most two newlines (single blank line)
+    md_text = re.sub(r'\n\s*\n+', '\n\n', md_text)
+    
+    # Compact multiple spaces into single spaces (useful after removing formatting)
+    md_text = re.sub(r'[ \t]+', ' ', md_text)
+    
+    # Strip leading/trailing whitespace from the entire text
+    return md_text.strip()
+
 
 class CrawlRequest(BaseModel):
     """
@@ -70,7 +117,8 @@ class CustomWebCrawler:
                 logger.info(f"Fetching: {url}")
                 response = await client.get(url, follow_redirects=True, timeout=30)
                 response.raise_for_status()
-                self.visited_urls.add(url) # Add to visited after successful fetch
+                # Only add to visited_urls after a successful fetch to allow retries if needed
+                self.visited_urls.add(url)
                 return response.text
         except httpx.RequestError as exc:
             error_msg = f"HTTPX Request Error for {url}: {exc}"
@@ -92,7 +140,7 @@ class CustomWebCrawler:
             abs_url = urljoin(base_url, href)
             # Only consider links within the same domain as the start_url
             if urlparse(abs_url).netloc == urlparse(self.start_url).netloc:
-                # Basic sanitization to remove fragments
+                # Basic sanitization to remove fragments (#section-id)
                 parsed_abs_url = urlparse(abs_url)
                 cleaned_url = parsed_abs_url._replace(fragment="").geturl()
                 links.add(cleaned_url)
@@ -134,47 +182,79 @@ class CustomWebCrawler:
 
         # Use httpx.AsyncClient for session management and connection pooling
         async with httpx.AsyncClient() as client:
-            while self.to_visit_queue and len(self.crawled_results) < self.max_pages:
-                current_url = self.to_visit_queue.popleft()
+            tasks = deque()
+            initial_url = self.to_visit_queue.popleft() # Get the first URL from the queue
 
-                # Skip if already visited or if it's already added to queue for processing
-                if current_url in self.visited_urls:
-                    continue
+            # Start the crawl with the initial URL
+            # This function will be called as long as there are URLs in the queue
+            # and max_pages hasn't been reached.
+            async def _worker():
+                while self.to_visit_queue and len(self.crawled_results) < self.max_pages:
+                    current_url = self.to_visit_queue.popleft()
+                    
+                    if current_url in self.visited_urls:
+                        continue
+                    
+                    html_content = await self._fetch_page_content(client, current_url)
+                    if html_content is None:
+                        continue
 
-                # Fetch content
-                html_content = await self._fetch_page_content(client, current_url)
-                if html_content is None:
-                    continue
+                    markdown_content = self._html_to_markdown(html_content)
+                    cleaned_markdown_content = clean_markdown(markdown_content) # Apply cleaning here!
+                    
+                    # Save markdown to file
+                    try:
+                        filename = self._sanitize_filename(current_url)
+                        file_path = self.output_dir / filename
+                        with open(file_path, "w", encoding="utf-8") as f:
+                            f.write(cleaned_markdown_content)
+                        saved_files_paths.append(str(file_path))
+                        self.crawled_results.append({'url': current_url, 'markdown': cleaned_markdown_content})
+                        logger.info(f"Saved cleaned markdown for {current_url} to {file_path}")
+                    except IOError as e:
+                        error_msg = f"Failed to save markdown for {current_url} to {file_path}: {e}"
+                        logger.error(error_msg, exc_info=True)
+                        self.errors.append(error_msg)
+                    except Exception as e:
+                        error_msg = f"Unexpected error saving markdown for {current_url}: {e}"
+                        logger.error(error_msg, exc_info=True)
+                        self.errors.append(error_msg)
 
-                # Convert to markdown and store
-                markdown_content = self._html_to_markdown(html_content)
-                
-                # Save markdown to file
-                try:
-                    filename = self._sanitize_filename(current_url)
-                    file_path = self.output_dir / filename
-                    with open(file_path, "w", encoding="utf-8") as f:
-                        f.write(markdown_content)
-                    saved_files_paths.append(str(file_path))
-                    self.crawled_results.append({'url': current_url, 'markdown': markdown_content})
-                    logger.info(f"Saved markdown for {current_url} to {file_path}")
-                except IOError as e:
-                    error_msg = f"Failed to save markdown for {current_url} to {file_path}: {e}"
-                    logger.error(error_msg, exc_info=True)
-                    self.errors.append(error_msg)
-                except Exception as e:
-                    error_msg = f"Unexpected error saving markdown for {current_url}: {e}"
-                    logger.error(error_msg, exc_info=True)
-                    self.errors.append(error_msg)
+                    # Extract new links if we haven't reached max_pages after current page
+                    if len(self.crawled_results) < self.max_pages:
+                        new_links = self._extract_links(html_content, current_url)
+                        for link in new_links:
+                            if link not in self.visited_urls and link not in self.to_visit_queue:
+                                self.to_visit_queue.append(link)
 
-                # Extract new links if we haven't reached max_pages
-                if len(self.crawled_results) < self.max_pages:
-                    new_links = self._extract_links(html_content, current_url)
-                    for link in new_links:
-                        if link not in self.visited_urls and link not in self.to_visit_queue:
-                            self.to_visit_queue.append(link)
-        
-        # Return count of successfully crawled pages and paths of saved files
+            # Pre-seed the queue with the initial URL for the worker to pick up
+            # This is important if the queue can be empty when workers start.
+            if initial_url not in self.visited_urls:
+                 self.to_visit_queue.append(initial_url)
+
+            # Create and run worker tasks
+            workers = [asyncio.create_task(_worker()) for _ in range(self.concurrency_limit)]
+            
+            # Continuously add tasks until the queue is exhausted or max_pages is reached
+            # This is a simplified way to manage the crawl loop.
+            # More robust crawlers would use a shared queue and cancellation tokens.
+            while len(self.crawled_results) < self.max_pages and (self.to_visit_queue or any(not t.done() for t in workers)):
+                await asyncio.sleep(0.1) # Give time for tasks to run
+                # Remove completed tasks and add new ones if needed
+                # This loop logic is simplified for illustration, a proper queue with cancellation
+                # and graceful shutdown would be more complex.
+                workers = [t for t in workers if not t.done()]
+                while len(workers) < self.concurrency_limit and self.to_visit_queue and len(self.crawled_results) < self.max_pages:
+                    workers.append(asyncio.create_task(_worker()))
+                if not workers and self.to_visit_queue and len(self.crawled_results) < self.max_pages:
+                     # All workers finished but queue still has items, this shouldn't happen with above logic
+                     # but helps break infinite loop if tasks are stuck.
+                     break 
+            
+            # Wait for any remaining active tasks to complete
+            await asyncio.gather(*workers, return_exceptions=True) # Allow tasks to finish or fail
+
+
         return len(self.crawled_results), saved_files_paths
 
 
@@ -182,7 +262,7 @@ class CustomWebCrawler:
 async def crawl_all_markdowns(request: CrawlRequest):
     """
     Crawls a website, retrieves markdown content for every page (up to max_pages),
-    and saves each page's markdown to the specified output directory.
+    and saves each page's CLEANED markdown to the specified output directory.
     """
     logger.info(f"Received request to crawl all markdowns for URL: {request.url}, max_pages: {request.max_pages}")
 
@@ -198,7 +278,7 @@ async def crawl_all_markdowns(request: CrawlRequest):
         total_pages_crawled, saved_files_paths = await crawler.crawl()
 
         if not crawler.errors and total_pages_crawled > 0:
-            message = f"Successfully crawled {total_pages_crawled} pages. Markdown files saved."
+            message = f"Successfully crawled {total_pages_crawled} pages. Cleaned markdown files saved."
             logger.info(message)
             return CrawlResponse(
                 success=True,
@@ -212,6 +292,7 @@ async def crawl_all_markdowns(request: CrawlRequest):
             if crawler.errors:
                 message += f" See errors for details."
             logger.warning(message)
+            # Raise HTTPException with the structured response detail for 500 errors
             raise HTTPException(
                 status_code=500,
                 detail=CrawlResponse(
@@ -236,10 +317,8 @@ async def crawl_all_markdowns(request: CrawlRequest):
 #    pip install "fastapi[all]" uvicorn httpx beautifulsoup4 html2text
 # 3. Run the FastAPI application using Uvicorn:
 #    uvicorn main:app --host 0.0.0.0 --port 8000 --workers 1
-#    (To potentially avoid PermissionError for /crawl_output2/, you might need to run:
-#     sudo uvicorn main:app --host 0.0.0.0 --port 8000 --workers 1
-#     However, using a user-writable directory (e.g., `Path.home() / "crawl_output2"`)
-#     is strongly preferred for security and ease of use.)
+#    (If you are on a system where permissions are still an issue, ensure your user has
+#     write access to the directory where your main.py script is located.)
 
 # --- Example Usage with curl (from another terminal) ---
 # To crawl a website (e.g., a documentation site or blog) and save all page markdowns:
