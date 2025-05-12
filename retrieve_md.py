@@ -3,13 +3,13 @@ import logging
 import os
 import re
 from collections import deque
-from pathlib import Path
+from pathlib import Path # Make sure Path is imported
 from typing import Dict, List, Optional, Set, Tuple
 from urllib.parse import urljoin, urlparse
 
 import httpx
 from bs4 import BeautifulSoup
-import html2text # For HTML to Markdown conversion
+import html2text
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, HttpUrl, Field
@@ -25,12 +25,9 @@ app = FastAPI(
 )
 
 # --- Output Directory Configuration ---
-# WARNING: Writing to /crawl_output2/ directly usually requires elevated permissions (sudo).
-# It is highly recommended to use a user-writable directory like:
-# output_base_dir = Path.home() / "crawl_output2" # In user's home directory
-# OR
-# output_base_dir = Path(__file__).parent / "crawl_output2" # Relative to script location
-output_base_dir = Path("/crawl_output2") # As specifically requested by the user
+# This will create the 'crawl_output2' folder inside your user's home directory on macOS
+# (e.g., /Users/yourusername/crawl_output2/). This is a highly recommended and user-writable location.
+output_base_dir = Path.home() / "crawl_output2"
 
 class CrawlRequest(BaseModel):
     """
