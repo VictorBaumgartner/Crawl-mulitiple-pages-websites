@@ -26,6 +26,9 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Web Scraper API", description="API pour scraper des pages web statiques et dynamiques")
 
+# Global lock for metadata file operations
+metadata_lock = asyncio.Lock()
+
 # Retry decorator for network operations
 retry_policy = retry(
     stop=stop_after_attempt(3),
@@ -34,19 +37,16 @@ retry_policy = retry(
     before_sleep=lambda retry_state: logger.info(f"Retrying {retry_state.fn.__name__} after {retry_state.next_action.sleep}s due to {retry_state.exception}")
 )
 
-# Global lock for metadata file operations
-metadata_lock = asyncio.Lock()
-
 # Modèle pour les requêtes de scraping
 class ScrapeRequest(BaseModel):
     url: str
     output_path: str = "./scraped_data"
-    dynamic: bool = False
+    dynamic: bool = True
     wait_time: int = 5
     wait_for_selector: Optional[str] = None
-    extract_links: bool = True
-    extract_images: bool = True
-    extract_text: bool = True
+    extract_links: bool = False
+    extract_images: bool = False
+    extract_text: bool = False
     extract_markdown: bool = True
     css_selector: Optional[str] = None
     filename_prefix: Optional[str] = None
@@ -216,10 +216,7 @@ async def scrape_page(
         if extract_text:
             text_soup = BeautifulSoup(str(target_soup), 'html.parser')
             for script_or_style in text_soup(["script", "style"]):
-                script_or_style.extract()
-            text = text_soup.get_text(separator="\n", strip=True)
-            text = re.sub(r'\n\s*\n+', '\n', text).strip()
-            result["text"] = text
+                script_or_style
 
         if extract_markdown:
             result["markdown"] = html_to_markdown(str(target_soup))
@@ -277,6 +274,7 @@ async def discover_site_urls(base_url: str, html_content: str, current_depth: in
     if current_depth < max_depth and new_urls:
         tasks = []
         for i, url_to_discover in enumerate(list(new_urls)):
+            # Changé: Supprimé la limite de 20 URLs pour découvrir plus de pages
             try:
                 async with aiohttp.ClientSession() as session:
                     async with session.get(url_to_discover, timeout=10) as response:
@@ -360,30 +358,32 @@ def extract_metadata(soup: BeautifulSoup, url: str) -> Dict[str, Any]:
     return metadata
 
 async def save_scraped_data(data: Dict[str, Any], output_path: str, filename_base: str) -> Dict[str, str]:
-    async with metadata_lock:
-        saved_files = {}
+    saved_files = {}
 
-        Path(output_path).mkdir(parents=True, exist_ok=True)
+    # Assurer que le répertoire de sortie existe
+    Path(output_path).mkdir(parents=True, exist_ok=True)
 
-        metadata_path = os.path.join(output_path, "website_metadata.json")
+    # Définir le chemin pour le fichier de métadonnées unique du site
+    metadata_path = os.path.join(output_path, "metadata.json")
 
-        if os.path.exists(metadata_path):
-            async with aiofiles.open(metadata_path, mode='r', encoding='utf-8') as f:
-                existing_metadata = json.loads(await f.read())
-            metadata_to_save = existing_metadata.copy()
-        else:
-            metadata_to_save = {
-                "scrape_time": "",
-                "title": None,
-                "description": None,
-                "keywords": None,
-                "author": None,
-                "og_tags": {},
-                "twitter_tags": {},
-                "links": [],
-                "images": [],
-                "crawled_urls": []
-            }
+    if os.path.exists(metadata_path):
+                async with aiofiles.open(metadata_path, mode='r', encoding='utf-8') as f:
+                    existing_metadata = json.loads(await f.read())
+                metadata_to_save = existing_metadata.copy()
+    else:
+    # Initialiser la structure des métadonnées
+        metadata_to_save = {
+            "scrape_time": data.get("metadata", {}).get("scrape_time", ""),
+            "title": data.get("metadata", {}).get("title"),
+            "description": data.get("metadata", {}).get("description"),
+            "keywords": data.get("metadata", {}).get("keywords"),
+            "author": data.get("metadata", {}).get("author"),
+            "og_tags": data.get("metadata", {}).get("og_tags", {}),
+            "twitter_tags": data.get("metadata", {}).get("twitter_tags", {}),
+            "links": [],
+            "images": [],
+            "crawled_urls": []
+        }
 
         # Set fields only if not already set
         if metadata_to_save.get("title") is None:
@@ -412,6 +412,12 @@ async def save_scraped_data(data: Dict[str, Any], output_path: str, filename_bas
         metadata_to_save.setdefault("links", []).extend(new_links)
         metadata_to_save.setdefault("images", []).extend(new_images)
 
+        # Add link URLs to crawled_urls
+        for link in new_links:
+            link_url = link.get("url")
+            if link_url and link_url not in metadata_to_save.get("crawled_urls", []):
+                metadata_to_save["crawled_urls"].append(link_url)
+
         # Save metadata
         async with aiofiles.open(metadata_path, mode='w', encoding='utf-8') as f:
             await f.write(json.dumps(metadata_to_save, ensure_ascii=False, indent=4))
@@ -424,50 +430,47 @@ async def save_scraped_data(data: Dict[str, Any], output_path: str, filename_bas
                 await f.write(data["markdown"])
             saved_files["markdown"] = md_path
 
-        return saved_files
+        logger.info(f"Enregistré {len(new_links)} liens et {len(new_images)} images pour {current_url}")
+    return saved_files
 
+@app.post("/scrape-site")
 async def scrape_site_endpoint(
     request: ScrapeRequest,
-    discovery_depth: int = Query(3, description="Profondeur de découverte des URLs du site (0-3)", ge=0, le=3),
+    discovery_depth: int = Query(1, description="Profondeur de découverte des URLs du site (0-3)", ge=0, le=3),
 ):
     if not re.match(r'^https?://', request.url):
-        raise HTTPException(status_code=400, detail=f"URL de base invalide: {request.url}")
+        raise HTTPException(status_code=400,
+                            detail=f"URL de base invalide: {request.url}")
 
     logger.info(f"Début du scraping du site: {request.url} avec profondeur: {discovery_depth}")
 
-    # Scrape the base URL first
-    base_result = await scrape_page(
-        url=request.url,
-        output_path=request.output_path,
-        dynamic=request.dynamic,
-        wait_time=request.wait_time,
-        wait_for_selector=request.wait_for_selector,
-        extract_links=True,
-        extract_images=True,
-        extract_text=True,
-        extract_markdown=True,
-        css_selector=request.css_selector,
-        filename_prefix=request.filename_prefix
-    )
+    initial_html_content = ""
+    initial_content_type = None
 
-    if "error" in base_result:
-        logger.error(f"Impossible de scraper la page de base {request.url}: {base_result.get('error')}")
-        return {"message": f"Échec du scraping de la page de base: {request.url}", "error": base_result.get('error')}
+    try:
+        if request.dynamic:
+            initial_html_content = await scrape_dynamic_page(request.url, request.wait_time, request.wait_for_selector)
+        else:
+            initial_html_content, initial_content_type = await scrape_static_page(request.url)
+            if initial_content_type and 'text/html' not in initial_content_type:
+                logger.warning(f"La page de base {request.url} n'est pas HTML (type: {initial_content_type})")
+    except HTTPException as e:
+        logger.error(f"Impossible de scraper la page initiale {request.url}: {e.detail}")
+        raise HTTPException(status_code=e.status_code, detail=f"Impossible de scraper la page initiale {request.url}: {e.detail}")
 
-    initial_html_content = base_result.get("html", "")
-    if not initial_html_content:
-        logger.warning(f"Aucun contenu HTML pour la page de base {request.url}")
-        return {"message": f"Aucun contenu HTML pour la page de base: {request.url}"}
+    discovered_urls = set([request.url])
+    if initial_html_content and discovery_depth > 0 and (not initial_content_type or 'text/html' in initial_content_type):
+        logger.info(f"Découverte des URLs à partir de {request.url} (profondeur: {discovery_depth})")
+        try:
+            discovered_urls.update(await discover_site_urls(request.url, initial_html_content, 0, discovery_depth, discovered_urls.copy()))
+            logger.info(f"{len(discovered_urls)} URLs uniques trouvées pour le site {request.url}")
+        except Exception as e:
+            logger.error(f"Erreur durant la découverte d'URLs pour {request.url}: {e}")
 
-    # Discover URLs starting from the base URL
-    discovered_urls = await discover_site_urls(request.url, initial_html_content, 0, discovery_depth, set([request.url]))
-    logger.info(f"{len(discovered_urls)} URLs uniques trouvées pour le site {request.url}")
-
-    # Exclude the base URL from the list for multiple scraping
-    url_list = [u for u in sorted(list(discovered_urls)) if u != request.url]
+    url_list = sorted(list(discovered_urls))
 
     if len(url_list) > request.max_pages:
-        logger.warning(f"Nombre d'URLs ({len(url_list)}) dépasse max_pages W ({request.max_pages})")
+        logger.warning(f"Nombre d'URLs ({len(url_list)}) dépasse max_pages ({request.max_pages})")
         url_list = url_list[:request.max_pages]
 
     multi_request = MultiScrapeRequest(
@@ -481,18 +484,18 @@ async def scrape_site_endpoint(
         extract_text=request.extract_text,
         extract_markdown=request.extract_markdown,
         css_selector=request.css_selector,
-        filename_prefix=request.filename_prefix or urlparse(request.url).netloc.replace("www.", ""),
+        filename_prefix=request.filename_prefix or urlparse(request.url).netloc.replace("www.",""),
         max_pages=request.max_pages
     )
 
-    logger.info(f"Lancement du scraping multiple pour {len(url_list)} URLs supplémentaires")
+    logger.info(f"Lancement du scraping multiple pour {len(url_list)} URLs")
     report = await scrape_multiple_endpoint(multi_request)
 
     report["discovery_summary"] = {
         "base_url": request.url,
         "discovery_depth_requested": discovery_depth,
-        "total_discovered": len(discovered_urls),
-        "urls_submitted_for_scraping": len(url_list) + 1  # +1 for the base URL
+        "initial_urls_found_for_discovery": len(discovered_urls),
+        "urls_submitted_for_scraping": len(url_list)
     }
     return report
 
