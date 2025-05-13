@@ -361,7 +361,7 @@ async def save_scraped_data(data: Dict[str, Any], output_path: str, filename_bas
     Path(output_path).mkdir(parents=True, exist_ok=True)
 
     # Définir le chemin pour le fichier de métadonnées unique du site
-    metadata_path = os.path.join(output_path, "website_metadata.json")
+    metadata_path = os.path.join(output_path, "metadata.json")
 
     # Initialiser la structure des métadonnées
     metadata_to_save = {
