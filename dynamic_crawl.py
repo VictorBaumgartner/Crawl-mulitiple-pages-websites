@@ -178,7 +178,7 @@ async def scrape_page(
         else:
             html_content, content_type_header = await scrape_static_page(url)
             if content_type_header and not any(ct in content_type_header for ct in ['text/html', 'application/xhtml+xml']):
-                logger.warning(f"Contenu non-HTML (type: {content_type_header}) pour {url}")
+                logger.warning(f"Contenu non-HTML (type: {content_type_header}) pour {url}. Pas de liens extraits.")
                 metadata = {
                     "url": url,
                     "scrape_time": datetime.now().isoformat(),
@@ -193,7 +193,7 @@ async def scrape_page(
                 return result_data
 
         if not html_content:
-            logger.warning(f"Aucun contenu HTML pour {url}")
+            logger.warning(f"Aucun contenu HTML pour {url}. Pas de liens extraits.")
             return {"url": url, "error": "Aucun contenu HTML récupéré"}
 
         soup = BeautifulSoup(html_content, 'html.parser')
@@ -203,7 +203,7 @@ async def scrape_page(
         if css_selector:
             selected_elements = soup.select(css_selector)
             if not selected_elements:
-                logger.warning(f"Aucun contenu pour le sélecteur '{css_selector}' sur {url}")
+                logger.warning(f"Aucun contenu pour le sélecteur '{css_selector}' sur {url}. Liens potentiellement limités.")
             else:
                 selected_html = "".join(str(el) for el in selected_elements)
                 target_soup = BeautifulSoup(selected_html, 'html.parser')
@@ -213,23 +213,22 @@ async def scrape_page(
         if extract_text:
             text_soup = BeautifulSoup(str(target_soup), 'html.parser')
             for script_or_style in text_soup(["script", "style"]):
-                script_or_style.extract()
-            text = text_soup.get_text(separator="\n", strip=True)
-            text = re.sub(r'\n\s*\n+', '\n', text).strip()
-            result["text"] = text
+                script_or_style
 
         if extract_markdown:
             result["markdown"] = html_to_markdown(str(target_soup))
 
         if extract_links:
-            links = [{"url": urljoin(url, a['href']), "text": a.get_text(strip=True) or "[Lien sans texte]"}
+            links = [{"url": urljoin(url, a['href']), "text": a.get_text(strip=True) or "[Lien sans texte]", "source_page": url}
                      for a in target_soup.find_all('a', href=True)]
             result["links"] = links
+            logger.info(f"Extrait {len(links)} liens de {url}")
 
         if extract_images:
-            images = [{"src": urljoin(url, img.get('src', '')), "alt": img.get('alt', '').strip()}
+            images = [{"src": urljoin(url, img.get('src', '')), "alt": img.get('alt', '').strip(), "source_page": url}
                       for img in target_soup.find_all('img') if img.get('src')]
             result["images"] = images
+            logger.info(f"Extrait {len(images)} images de {url}")
 
         filename_base = get_safe_filename(url, filename_prefix)
         saved_files = await save_scraped_data(result, output_path, filename_base)
@@ -272,9 +271,7 @@ async def discover_site_urls(base_url: str, html_content: str, current_depth: in
     if current_depth < max_depth and new_urls:
         tasks = []
         for i, url_to_discover in enumerate(list(new_urls)):
-            if i >= 20:
-                logger.warning(f"Limitation de la découverte à 20 URLs pour le niveau {current_depth+1} à partir de {base_url}")
-                break
+            # Changé: Supprimé la limite de 20 URLs pour découvrir plus de pages
             try:
                 async with aiohttp.ClientSession() as session:
                     async with session.get(url_to_discover, timeout=10) as response:
@@ -360,13 +357,13 @@ def extract_metadata(soup: BeautifulSoup, url: str) -> Dict[str, Any]:
 async def save_scraped_data(data: Dict[str, Any], output_path: str, filename_base: str) -> Dict[str, str]:
     saved_files = {}
 
-    # Ensure output directory exists
+    # Assurer que le répertoire de sortie existe
     Path(output_path).mkdir(parents=True, exist_ok=True)
 
-    # Define path for the single website metadata file
+    # Définir le chemin pour le fichier de métadonnées unique du site
     metadata_path = os.path.join(output_path, "website_metadata.json")
 
-    # Initialize metadata structure
+    # Initialiser la structure des métadonnées
     metadata_to_save = {
         "scrape_time": data.get("metadata", {}).get("scrape_time", ""),
         "title": data.get("metadata", {}).get("title"),
@@ -379,15 +376,10 @@ async def save_scraped_data(data: Dict[str, Any], output_path: str, filename_bas
         "images": []
     }
 
-    # Load existing metadata if it exists
-    existing_links = set()
-    existing_images = set()
+    # Charger les métadonnées existantes si elles existent
     if os.path.exists(metadata_path):
         async with aiofiles.open(metadata_path, mode='r', encoding='utf-8') as f:
             existing_metadata = json.loads(await f.read())
-            existing_links = set(tuple(link.items()) if isinstance(link, dict) else link for link in existing_metadata.get("links", []))
-            existing_images = set(tuple(img.items()) if isinstance(img, dict) else img for img in existing_metadata.get("images", []))
-            # Preserve existing metadata fields
             metadata_to_save.update({
                 "scrape_time": existing_metadata.get("scrape_time", metadata_to_save["scrape_time"]),
                 "title": existing_metadata.get("title", metadata_to_save["title"]),
@@ -395,25 +387,26 @@ async def save_scraped_data(data: Dict[str, Any], output_path: str, filename_bas
                 "keywords": existing_metadata.get("keywords", metadata_to_save["keywords"]),
                 "author": existing_metadata.get("author", metadata_to_save["author"]),
                 "og_tags": existing_metadata.get("og_tags", metadata_to_save["og_tags"]),
-                "twitter_tags": existing_metadata.get("twitter_tags", metadata_to_save["twitter_tags"])
+                "twitter_tags": existing_metadata.get("twitter_tags", metadata_to_save["twitter_tags"]),
+                "links": existing_metadata.get("links", []),
+                "images": existing_metadata.get("images", [])
             })
 
-    # Add new links and images, ensuring uniqueness
+    # Ajouter les nouveaux liens et images sans déduplication
     new_links = data.get("links", [])
     new_images = data.get("images", [])
-    # Convert new links and images to sets of tuples for comparison
-    new_links_set = set(tuple(link.items()) if isinstance(link, dict) else link for link in new_links)
-    new_images_set = set(tuple(img.items()) if isinstance(img, dict) else img for img in new_images)
-    # Update metadata with unique links and images
-    metadata_to_save["links"] = [dict(link) if isinstance(link, tuple) else link for link in existing_links.union(new_links_set)]
-    metadata_to_save["images"] = [dict(img) if isinstance(img, tuple) else img for img in existing_images.union(new_images_set)]
+    metadata_to_save["links"].extend(new_links)
+    metadata_to_save["images"].extend(new_images)
 
-    # Save the updated metadata
+    # Journaliser le nombre de liens ajoutés
+    logger.info(f"Ajouté {len(new_links)} nouveaux liens et {len(new_images)} nouvelles images pour {data.get('metadata', {}).get('url', 'inconnu')}")
+
+    # Sauvegarder les métadonnées mises à jour
     async with aiofiles.open(metadata_path, mode='w', encoding='utf-8') as f:
         await f.write(json.dumps(metadata_to_save, ensure_ascii=False, indent=4))
     saved_files["metadata"] = metadata_path
 
-    # Save markdown file if present
+    # Sauvegarder le fichier markdown si présent
     if data.get("markdown"):
         md_path = os.path.join(output_path, f"{filename_base}.md")
         async with aiofiles.open(md_path, mode='w', encoding='utf-8') as f:
