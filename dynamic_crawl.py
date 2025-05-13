@@ -34,6 +34,9 @@ retry_policy = retry(
     before_sleep=lambda retry_state: logger.info(f"Retrying {retry_state.fn.__name__} after {retry_state.next_action.sleep}s due to {retry_state.exception}")
 )
 
+# Global lock for metadata file operations
+metadata_lock = asyncio.Lock()
+
 # Modèle pour les requêtes de scraping
 class ScrapeRequest(BaseModel):
     url: str
@@ -213,7 +216,10 @@ async def scrape_page(
         if extract_text:
             text_soup = BeautifulSoup(str(target_soup), 'html.parser')
             for script_or_style in text_soup(["script", "style"]):
-                script_or_style
+                script_or_style.extract()
+            text = text_soup.get_text(separator="\n", strip=True)
+            text = re.sub(r'\n\s*\n+', '\n', text).strip()
+            result["text"] = text
 
         if extract_markdown:
             result["markdown"] = html_to_markdown(str(target_soup))
@@ -271,7 +277,6 @@ async def discover_site_urls(base_url: str, html_content: str, current_depth: in
     if current_depth < max_depth and new_urls:
         tasks = []
         for i, url_to_discover in enumerate(list(new_urls)):
-            # Changé: Supprimé la limite de 20 URLs pour découvrir plus de pages
             try:
                 async with aiohttp.ClientSession() as session:
                     async with session.get(url_to_discover, timeout=10) as response:
@@ -355,104 +360,114 @@ def extract_metadata(soup: BeautifulSoup, url: str) -> Dict[str, Any]:
     return metadata
 
 async def save_scraped_data(data: Dict[str, Any], output_path: str, filename_base: str) -> Dict[str, str]:
-    saved_files = {}
+    async with metadata_lock:
+        saved_files = {}
 
-    # Assurer que le répertoire de sortie existe
-    Path(output_path).mkdir(parents=True, exist_ok=True)
+        Path(output_path).mkdir(parents=True, exist_ok=True)
 
-    # Définir le chemin pour le fichier de métadonnées unique du site
-    metadata_path = os.path.join(output_path, "metadata.json")
+        metadata_path = os.path.join(output_path, "website_metadata.json")
 
-    # Initialiser la structure des métadonnées
-    metadata_to_save = {
-        "scrape_time": data.get("metadata", {}).get("scrape_time", ""),
-        "title": data.get("metadata", {}).get("title"),
-        "description": data.get("metadata", {}).get("description"),
-        "keywords": data.get("metadata", {}).get("keywords"),
-        "author": data.get("metadata", {}).get("author"),
-        "og_tags": data.get("metadata", {}).get("og_tags", {}),
-        "twitter_tags": data.get("metadata", {}).get("twitter_tags", {}),
-        "links": [],
-        "images": []
-    }
+        if os.path.exists(metadata_path):
+            async with aiofiles.open(metadata_path, mode='r', encoding='utf-8') as f:
+                existing_metadata = json.loads(await f.read())
+            metadata_to_save = existing_metadata.copy()
+        else:
+            metadata_to_save = {
+                "scrape_time": "",
+                "title": None,
+                "description": None,
+                "keywords": None,
+                "author": None,
+                "og_tags": {},
+                "twitter_tags": {},
+                "links": [],
+                "images": [],
+                "crawled_urls": []
+            }
 
-    # Charger les métadonnées existantes si elles existent
-    if os.path.exists(metadata_path):
-        async with aiofiles.open(metadata_path, mode='r', encoding='utf-8') as f:
-            existing_metadata = json.loads(await f.read())
-            metadata_to_save.update({
-                "scrape_time": existing_metadata.get("scrape_time", metadata_to_save["scrape_time"]),
-                "title": existing_metadata.get("title", metadata_to_save["title"]),
-                "description": existing_metadata.get("description", metadata_to_save["description"]),
-                "keywords": existing_metadata.get("keywords", metadata_to_save["keywords"]),
-                "author": existing_metadata.get("author", metadata_to_save["author"]),
-                "og_tags": existing_metadata.get("og_tags", metadata_to_save["og_tags"]),
-                "twitter_tags": existing_metadata.get("twitter_tags", metadata_to_save["twitter_tags"]),
-                "links": existing_metadata.get("links", []),
-                "images": existing_metadata.get("images", [])
-            })
+        # Set fields only if not already set
+        if metadata_to_save.get("title") is None:
+            metadata_to_save["title"] = data.get("metadata", {}).get("title")
+        if metadata_to_save.get("description") is None:
+            metadata_to_save["description"] = data.get("metadata", {}).get("description")
+        if metadata_to_save.get("keywords") is None:
+            metadata_to_save["keywords"] = data.get("metadata", {}).get("keywords")
+        if metadata_to_save.get("author") is None:
+            metadata_to_save["author"] = data.get("metadata", {}).get("author")
+        if not metadata_to_save.get("og_tags"):
+            metadata_to_save["og_tags"] = data.get("metadata", {}).get("og_tags", {})
+        if not metadata_to_save.get("twitter_tags"):
+            metadata_to_save["twitter_tags"] = data.get("metadata", {}).get("twitter_tags", {})
+        if not metadata_to_save.get("scrape_time"):
+            metadata_to_save["scrape_time"] = data.get("metadata", {}).get("scrape_time", "")
 
-    # Ajouter les nouveaux liens et images sans déduplication
-    new_links = data.get("links", [])
-    new_images = data.get("images", [])
-    metadata_to_save["links"].extend(new_links)
-    metadata_to_save["images"].extend(new_images)
+        # Add current URL to crawled_urls if not present
+        current_url = data.get("metadata", {}).get("url")
+        if current_url and current_url not in metadata_to_save.get("crawled_urls", []):
+            metadata_to_save.setdefault("crawled_urls", []).append(current_url)
 
-    # Journaliser le nombre de liens ajoutés
-    logger.info(f"Ajouté {len(new_links)} nouveaux liens et {len(new_images)} nouvelles images pour {data.get('metadata', {}).get('url', 'inconnu')}")
+        # Extend links and images
+        new_links = data.get("links", [])
+        new_images = data.get("images", [])
+        metadata_to_save.setdefault("links", []).extend(new_links)
+        metadata_to_save.setdefault("images", []).extend(new_images)
 
-    # Sauvegarder les métadonnées mises à jour
-    async with aiofiles.open(metadata_path, mode='w', encoding='utf-8') as f:
-        await f.write(json.dumps(metadata_to_save, ensure_ascii=False, indent=4))
-    saved_files["metadata"] = metadata_path
+        # Save metadata
+        async with aiofiles.open(metadata_path, mode='w', encoding='utf-8') as f:
+            await f.write(json.dumps(metadata_to_save, ensure_ascii=False, indent=4))
+        saved_files["metadata"] = metadata_path
 
-    # Sauvegarder le fichier markdown si présent
-    if data.get("markdown"):
-        md_path = os.path.join(output_path, f"{filename_base}.md")
-        async with aiofiles.open(md_path, mode='w', encoding='utf-8') as f:
-            await f.write(data["markdown"])
-        saved_files["markdown"] = md_path
+        # Save markdown if present
+        if data.get("markdown"):
+            md_path = os.path.join(output_path, f"{filename_base}.md")
+            async with aiofiles.open(md_path, mode='w', encoding='utf-8') as f:
+                await f.write(data["markdown"])
+            saved_files["markdown"] = md_path
 
-    return saved_files
+        return saved_files
 
-@app.post("/scrape-site")
 async def scrape_site_endpoint(
     request: ScrapeRequest,
     discovery_depth: int = Query(1, description="Profondeur de découverte des URLs du site (0-3)", ge=0, le=3),
 ):
     if not re.match(r'^https?://', request.url):
-        raise HTTPException(status_code=400,
-                            detail=f"URL de base invalide: {request.url}")
+        raise HTTPException(status_code=400, detail=f"URL de base invalide: {request.url}")
 
     logger.info(f"Début du scraping du site: {request.url} avec profondeur: {discovery_depth}")
 
-    initial_html_content = ""
-    initial_content_type = None
+    # Scrape the base URL first
+    base_result = await scrape_page(
+        url=request.url,
+        output_path=request.output_path,
+        dynamic=request.dynamic,
+        wait_time=request.wait_time,
+        wait_for_selector=request.wait_for_selector,
+        extract_links=True,
+        extract_images=True,
+        extract_text=True,
+        extract_markdown=True,
+        css_selector=request.css_selector,
+        filename_prefix=request.filename_prefix
+    )
 
-    try:
-        if request.dynamic:
-            initial_html_content = await scrape_dynamic_page(request.url, request.wait_time, request.wait_for_selector)
-        else:
-            initial_html_content, initial_content_type = await scrape_static_page(request.url)
-            if initial_content_type and 'text/html' not in initial_content_type:
-                logger.warning(f"La page de base {request.url} n'est pas HTML (type: {initial_content_type})")
-    except HTTPException as e:
-        logger.error(f"Impossible de scraper la page initiale {request.url}: {e.detail}")
-        raise HTTPException(status_code=e.status_code, detail=f"Impossible de scraper la page initiale {request.url}: {e.detail}")
+    if "error" in base_result:
+        logger.error(f"Impossible de scraper la page de base {request.url}: {base_result.get('error')}")
+        return {"message": f"Échec du scraping de la page de base: {request.url}", "error": base_result.get('error')}
 
-    discovered_urls = set([request.url])
-    if initial_html_content and discovery_depth > 0 and (not initial_content_type or 'text/html' in initial_content_type):
-        logger.info(f"Découverte des URLs à partir de {request.url} (profondeur: {discovery_depth})")
-        try:
-            discovered_urls.update(await discover_site_urls(request.url, initial_html_content, 0, discovery_depth, discovered_urls.copy()))
-            logger.info(f"{len(discovered_urls)} URLs uniques trouvées pour le site {request.url}")
-        except Exception as e:
-            logger.error(f"Erreur durant la découverte d'URLs pour {request.url}: {e}")
+    initial_html_content = base_result.get("html", "")
+    if not initial_html_content:
+        logger.warning(f"Aucun contenu HTML pour la page de base {request.url}")
+        return {"message": f"Aucun contenu HTML pour la page de base: {request.url}"}
 
-    url_list = sorted(list(discovered_urls))
+    # Discover URLs starting from the base URL
+    discovered_urls = await discover_site_urls(request.url, initial_html_content, 0, discovery_depth, set([request.url]))
+    logger.info(f"{len(discovered_urls)} URLs uniques trouvées pour le site {request.url}")
+
+    # Exclude the base URL from the list for multiple scraping
+    url_list = [u for u in sorted(list(discovered_urls)) if u != request.url]
 
     if len(url_list) > request.max_pages:
-        logger.warning(f"Nombre d'URLs ({len(url_list)}) dépasse max_pages ({request.max_pages})")
+        logger.warning(f"Nombre d'URLs ({len(url_list)}) dépasse max_pages W ({request.max_pages})")
         url_list = url_list[:request.max_pages]
 
     multi_request = MultiScrapeRequest(
@@ -466,18 +481,18 @@ async def scrape_site_endpoint(
         extract_text=request.extract_text,
         extract_markdown=request.extract_markdown,
         css_selector=request.css_selector,
-        filename_prefix=request.filename_prefix or urlparse(request.url).netloc.replace("www.",""),
+        filename_prefix=request.filename_prefix or urlparse(request.url).netloc.replace("www.", ""),
         max_pages=request.max_pages
     )
 
-    logger.info(f"Lancement du scraping multiple pour {len(url_list)} URLs")
+    logger.info(f"Lancement du scraping multiple pour {len(url_list)} URLs supplémentaires")
     report = await scrape_multiple_endpoint(multi_request)
 
     report["discovery_summary"] = {
         "base_url": request.url,
         "discovery_depth_requested": discovery_depth,
-        "initial_urls_found_for_discovery": len(discovered_urls),
-        "urls_submitted_for_scraping": len(url_list)
+        "total_discovered": len(discovered_urls),
+        "urls_submitted_for_scraping": len(url_list) + 1  # +1 for the base URL
     }
     return report
 
