@@ -17,9 +17,8 @@ from fastapi import FastAPI, HTTPException, Query
 from playwright.async_api import async_playwright
 from pydantic import BaseModel
 
-# (Keep your existing logging setup, FastAPI app, and Pydantic models)
 # Configuration du logging
-logging.basicConfig(level=logging.INFO, 
+logging.basicConfig(level=logging.INFO,
                     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
@@ -55,215 +54,14 @@ class MultiScrapeRequest(BaseModel):
     parallel_workers: int = 18
     filename_prefix: Optional[str] = None
     max_pages: int = 3000
+    # New parameter to control saving individual metadata files
+    save_individual_metadata: bool = True
 
 
-# (Keep your discover_site_urls, scrape_site_endpoint, get_safe_filename, html_to_markdown, extract_metadata, save_scraped_data functions as they are generally fine)
-# ... (all helper functions from your provided code) ...
-# For brevity, I'll assume they are present here. The key changes are in scrape_static_page, scrape_dynamic_page (minor), and scrape_page.
+# Helper functions (discover_site_urls, get_safe_filename, html_to_markdown, extract_metadata)
+# These functions remain unchanged from your original code.
 
-async def scrape_static_page(url: str) -> tuple[str, Optional[str]]:
-    """
-    Scrapes a static page.
-    Returns:
-        A tuple (html_content, content_type). html_content can be empty if not text/html.
-    """
-    try:
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8"
-        }
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, headers=headers, timeout=30, allow_redirects=True) as response:
-                if response.status >= 400:
-                    raise HTTPException(status_code=response.status, 
-                                        detail=f"Erreur HTTP {response.status} pour {url}")
-                
-                content_type = response.headers.get('Content-Type', '').lower()
-                content = await response.text() # Read content regardless for now
-                return content, content_type
-                
-    except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-        logger.error(f"Erreur lors du scraping statique de {url}: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Erreur lors du scraping statique de {url}: {str(e)}")
-
-async def scrape_dynamic_page(url: str, wait_time: int = 5, wait_for_selector: Optional[str] = None) -> str:
-    try:
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=True)
-            context = await browser.new_context(
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
-            )
-            page = await context.new_page()
-            
-            # Handle cases where the URL itself might be a direct link to an image/binary
-            # Playwright will try to render it, page.content() will give the HTML representation.
-            # So, the content_type check will be more crucial in scrape_page
-            try:
-                await page.goto(url, wait_until="networkidle", timeout=60000)
-            except Exception as e: # Broad exception for goto errors
-                logger.error(f"Playwright: Erreur 'goto' pour {url}: {e}")
-                await browser.close()
-                # Return a minimal HTML structure or raise, so scrape_page can handle it
-                # This indicates the page itself might not be navigable as standard HTML
-                raise HTTPException(status_code=500, detail=f"Playwright: Erreur 'goto' pour {url}: {e}")
-
-
-            if wait_for_selector:
-                try:
-                    await page.wait_for_selector(wait_for_selector, timeout=wait_time * 1000)
-                except Exception: # Catch Playwright's TimeoutError
-                    logger.warning(f"Sélecteur '{wait_for_selector}' non trouvé sur {url} (dynamique)")
-                    pass # Continue even if selector isn't found
-            else:
-                await asyncio.sleep(wait_time)
-            
-            content = await page.content()
-            await browser.close()
-            return content
-    except Exception as e:
-        logger.error(f"Erreur lors du scraping dynamique de {url}: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Erreur lors du scraping dynamique de {url}: {str(e)}")
-
-async def scrape_page(
-    url: str,
-    output_path: str,
-    dynamic: bool = False,
-    wait_time: int = 5,
-    wait_for_selector: Optional[str] = None,
-    extract_links: bool = True,
-    extract_images: bool = True,
-    extract_text: bool = True,
-    extract_markdown: bool = True,
-    css_selector: Optional[str] = None,
-    filename_prefix: Optional[str] = None
-) -> Dict[str, Any]:
-    try:
-        logger.info(f"Scraping de {url} (mode: {'dynamique' if dynamic else 'statique'})")
-        
-        if not re.match(r'^https?://', url):
-            logger.error(f"URL invalide: {url}. Tentative de scraping annulée.")
-            return {"url": url, "error": f"URL invalide: {url}. L'URL doit commencer par http:// ou https://"}
-
-        # --- Solution Part 1: Handle problematic 'string' selector ---
-        if css_selector and css_selector.lower() == "string":
-            logger.warning(f"Le sélecteur CSS non valide 'string' a été fourni pour {url}. "
-                           f"Il sera ignoré et le contenu de la page entière sera traité.")
-            css_selector = None 
-
-        html_content = ""
-        content_type_header = None # For static pages
-
-        # --- Solution Part 2: Handle non-HTML content (basic check for URL extension) ---
-        # More robust check will be done after fetching content for static pages
-        is_likely_binary = any(url.lower().endswith(ext) for ext in 
-                                ['.jpg', '.jpeg', '.png', '.gif', '.bmp', '.pdf', '.zip', '.gz', '.webp', '.svg',
-                                 '.mp4', '.mov', '.avi', '.mp3', '.wav'])
-        
-        if is_likely_binary and not dynamic: # For static, we can be more certain. Dynamic might wrap it.
-             logger.info(f"L'URL {url} semble pointer vers un fichier binaire/image (vérification par extension). "
-                        f"Extraction de contenu HTML structuré sera probablement ignorée.")
-             # Attempt to fetch anyway, content_type will confirm
-        
-        if dynamic:
-            html_content = await scrape_dynamic_page(url, wait_time, wait_for_selector)
-            # For dynamic content, we assume it's HTML-like as Playwright renders it.
-            # If the URL was a direct image, Playwright might wrap it in a simple HTML.
-        else:
-            html_content, content_type_header = await scrape_static_page(url)
-            if content_type_header and not any(ct in content_type_header for ct in ['text/html', 'application/xhtml+xml', 'application/xml']):
-                logger.warning(f"Contenu non-HTML (type: {content_type_header}) détecté pour {url} via requête statique. "
-                               f"Extraction de texte/liens/images HTML sera limitée.")
-                # Create metadata and save what we have (e.g., the raw content if it's text-based, or just URL)
-                metadata = {"url": url, "scrape_time": datetime.now().isoformat(), "title": os.path.basename(urlparse(url).path), "content_type": content_type_header}
-                result_data = {"metadata": metadata}
-                if "text/" in content_type_header: # if it's some form of text
-                     result_data["text"] = html_content # Store the raw text
-                
-                filename_base = get_safe_filename(url, filename_prefix)
-                saved_files = await save_scraped_data(result_data, output_path, filename_base)
-                result_data["saved_files"] = saved_files
-                return result_data
-
-        if not html_content:
-            logger.warning(f"Aucun contenu HTML récupéré pour {url}.")
-            return {"url": url, "error": "Aucun contenu HTML récupéré."}
-
-        soup = BeautifulSoup(html_content, 'html.parser')
-        metadata = extract_metadata(soup, url) # Extract metadata from the whole page first
-        
-        target_soup = soup # This will be the soup used for extraction (either full or selected part)
-
-        # --- Solution Part 3: Refined CSS selector logic ---
-        if css_selector: # This is after "string" has been handled (set to None)
-            selected_elements = soup.select(css_selector)
-            if not selected_elements:
-                logger.warning(f"Aucun contenu trouvé avec le sélecteur CSS spécifié: '{css_selector}' pour {url}. "
-                               f"Le contenu de la page entière sera utilisé pour l'extraction.")
-                # target_soup remains the original full soup, which is the desired fallback
-            else:
-                logger.info(f"Contenu trouvé et filtré avec le sélecteur '{css_selector}' pour {url}.")
-                # Create a new soup from selected elements to isolate them
-                # This is better than modifying the original 'soup' in place
-                # We join their string representations to form a new HTML snippet
-                selected_html_snippet = "".join(str(el) for el in selected_elements)
-                target_soup = BeautifulSoup(selected_html_snippet, 'html.parser')
-        
-        result = {"metadata": metadata, "html": html_content} # Always save original full HTML
-
-        # Perform extractions using the target_soup (which is either full page or selected part)
-        if extract_text:
-            # Create a temporary soup for text extraction to avoid modifying target_soup if it's used elsewhere
-            text_extraction_soup = BeautifulSoup(str(target_soup), 'html.parser')
-            for script_or_style in text_extraction_soup(["script", "style"]):
-                script_or_style.extract()
-            text = text_extraction_soup.get_text(separator="\n", strip=True)
-            text = re.sub(r'\n\s*\n+', '\n', text) # Consolidate multiple newlines
-            text = re.sub(r' +', ' ', text) # Consolidate multiple spaces
-            result["text"] = text.strip()
-        
-        if extract_markdown:
-            markdown_content = html_to_markdown(str(target_soup))
-            result["markdown"] = markdown_content
-        
-        if extract_links:
-            links = []
-            for a_tag in target_soup.find_all('a', href=True):
-                href = a_tag['href']
-                absolute_url = urljoin(url, href) # Base URL for resolving relative links is the original page URL
-                link_text = a_tag.get_text(strip=True) or "[Lien sans texte]"
-                links.append({"url": absolute_url, "text": link_text})
-            result["links"] = links
-            
-        if extract_images:
-            images = []
-            for img_tag in target_soup.find_all('img'):
-                src = img_tag.get('src')
-                if src: # Ensure src attribute exists
-                    absolute_src = urljoin(url, src) # Base URL for resolving relative links
-                    alt_text = img_tag.get('alt', '').strip()
-                    images.append({"src": absolute_src, "alt": alt_text})
-            result["images"] = images
-            
-        filename_base = get_safe_filename(url, filename_prefix)
-        saved_files = await save_scraped_data(result, output_path, filename_base)
-        result["saved_files"] = saved_files
-        
-        return result
-    
-    except HTTPException as he: # Re-raise HTTPExceptions from called functions
-        logger.error(f"HTTPException lors du scraping de {url}: {he.detail}")
-        return {"url": url, "error": f"HTTPException: {he.status_code} - {he.detail}"}
-    except Exception as e:
-        import traceback
-        logger.error(f"Erreur inattendue lors du scraping de {url}: {str(e)}\n{traceback.format_exc()}")
-        return {"url": url, "error": str(e), "traceback": traceback.format_exc()}
-
-# (Keep your discover_site_urls, get_safe_filename, html_to_markdown, extract_metadata, save_scraped_data,
-#  scrape_site_endpoint, scrape_endpoint, scrape_multiple_endpoint, and root endpoint functions as they were.)
-# Make sure they call the modified scrape_page.
-
-# Example of how discover_site_urls, scrape_endpoint etc. would remain:
-async def discover_site_urls(base_url: str, html_content: str, current_depth: int = 0, max_depth: int = 2, 
+async def discover_site_urls(base_url: str, html_content: str, current_depth: int = 0, max_depth: int = 2,
                              already_discovered: Optional[set] = None) -> set:
     if already_discovered is None:
         already_discovered = set()
@@ -290,14 +88,11 @@ async def discover_site_urls(base_url: str, html_content: str, current_depth: in
     
     if current_depth < max_depth and new_urls:
         tasks = []
-        # Limit concurrent discovery calls to avoid overwhelming servers or getting rate-limited
-        # This part is illustrative; actual concurrency management might be needed if many new URLs are found
         for i, url_to_discover in enumerate(list(new_urls)):
             if i >= 20: # Limit discovery per level to prevent explosion
                  logger.warning(f"Limitation de la découverte à 20 URLs pour le niveau {current_depth+1} à partir de {base_url}")
                  break
             try:
-                # Using a new session for each discovery to simplify, but a shared session could be more efficient
                 async with aiohttp.ClientSession() as session:
                     async with session.get(url_to_discover, timeout=10) as response:
                         if response.status == 200:
@@ -346,7 +141,6 @@ def html_to_markdown(html_content: str) -> str:
         logger.error(f"Erreur de conversion HTML vers Markdown: {e}")
         return f"Erreur de conversion en Markdown: {e}"
 
-
 def extract_metadata(soup: BeautifulSoup, url: str) -> Dict[str, Any]:
     metadata = {
         "url": url,
@@ -365,10 +159,10 @@ def extract_metadata(soup: BeautifulSoup, url: str) -> Dict[str, Any]:
     
     for meta in soup.find_all("meta"):
         name = meta.get("name", "").lower()
-        prop = meta.get("property", "").lower() # Corrected variable name
+        prop = meta.get("property", "").lower()
         content = meta.get("content", "")
         
-        if not content: continue # Skip empty content
+        if not content: continue
 
         if name == "description":
             metadata["description"] = content
@@ -378,17 +172,18 @@ def extract_metadata(soup: BeautifulSoup, url: str) -> Dict[str, Any]:
             metadata["author"] = content
         elif prop.startswith("og:"):
             metadata["og_tags"][prop[3:]] = content
-        elif prop.startswith("twitter:"): # Corrected from property to prop
-            metadata["twitter_tags"][prop[8:]] = content # Corrected from property to prop
+        elif prop.startswith("twitter:"):
+            metadata["twitter_tags"][prop[8:]] = content
     
     return metadata
 
-async def save_scraped_data(data: Dict[str, Any], output_path: str, filename_base: str) -> Dict[str, str]:
+async def save_scraped_data(data: Dict[str, Any], output_path: str, filename_base: str, save_individual_metadata: bool = True) -> Dict[str, str]:
     saved_files = {}
     
-    Path(output_path).mkdir(parents=True, exist_ok=True) # Use pathlib for path creation
+    Path(output_path).mkdir(parents=True, exist_ok=True)
     
-    if data.get("metadata"):
+    # Only save individual metadata.json if the flag is True
+    if data.get("metadata") and save_individual_metadata:
         metadata_path = os.path.join(output_path, f"{filename_base}_metadata.json")
         async with aiofiles.open(metadata_path, mode='w', encoding='utf-8') as f:
             await f.write(json.dumps(data["metadata"], ensure_ascii=False, indent=4))
@@ -426,13 +221,202 @@ async def save_scraped_data(data: Dict[str, Any], output_path: str, filename_bas
             
     return saved_files
 
+
+async def scrape_static_page(url: str) -> tuple[str, Optional[str]]:
+    """
+    Scrapes a static page.
+    Returns:
+        A tuple (html_content, content_type). html_content can be empty if not text/html.
+    """
+    try:
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8"
+        }
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, headers=headers, timeout=30, allow_redirects=True) as response:
+                if response.status >= 400:
+                    raise HTTPException(status_code=response.status,
+                                        detail=f"Erreur HTTP {response.status} pour {url}")
+                
+                content_type = response.headers.get('Content-Type', '').lower()
+                content = await response.text() # Read content regardless for now
+                return content, content_type
+                
+    except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+        logger.error(f"Erreur lors du scraping statique de {url}: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Erreur lors du scraping statique de {url}: {str(e)}")
+
+async def scrape_dynamic_page(url: str, wait_time: int = 5, wait_for_selector: Optional[str] = None) -> str:
+    try:
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=True)
+            context = await browser.new_context(
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+            )
+            page = await context.new_page()
+            
+            try:
+                await page.goto(url, wait_until="networkidle", timeout=60000)
+            except Exception as e: # Broad exception for goto errors
+                logger.error(f"Playwright: Erreur 'goto' pour {url}: {e}")
+                await browser.close()
+                raise HTTPException(status_code=500, detail=f"Playwright: Erreur 'goto' pour {url}: {e}")
+
+
+            if wait_for_selector:
+                try:
+                    await page.wait_for_selector(wait_for_selector, timeout=wait_time * 1000)
+                except Exception: # Catch Playwright's TimeoutError
+                    logger.warning(f"Sélecteur '{wait_for_selector}' non trouvé sur {url} (dynamique)")
+                    pass # Continue even if selector isn't found
+            else:
+                await asyncio.sleep(wait_time)
+            
+            content = await page.content()
+            await browser.close()
+            return content
+    except Exception as e:
+        logger.error(f"Erreur lors du scraping dynamique de {url}: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Erreur lors du scraping dynamique de {url}: {str(e)}")
+
+async def scrape_page(
+    url: str,
+    output_path: str,
+    dynamic: bool = False,
+    wait_time: int = 5,
+    wait_for_selector: Optional[str] = None,
+    extract_links: bool = True,
+    extract_images: bool = True,
+    extract_text: bool = True,
+    extract_markdown: bool = True,
+    css_selector: Optional[str] = None,
+    filename_prefix: Optional[str] = None,
+    save_individual_metadata: bool = True # New parameter
+) -> Dict[str, Any]:
+    try:
+        logger.info(f"Scraping de {url} (mode: {'dynamique' if dynamic else 'statique'})")
+        
+        if not re.match(r'^https?://', url):
+            logger.error(f"URL invalide: {url}. Tentative de scraping annulée.")
+            return {"url": url, "error": f"URL invalide: {url}. L'URL doit commencer par http:// ou https://"}
+
+        # --- Solution Part 1: Handle problematic 'string' selector ---
+        if css_selector and css_selector.lower() == "string":
+            logger.warning(f"Le sélecteur CSS non valide 'string' a été fourni pour {url}. "
+                            f"Il sera ignoré et le contenu de la page entière sera traité.")
+            css_selector = None
+
+        html_content = ""
+        content_type_header = None # For static pages
+
+        # --- Solution Part 2: Handle non-HTML content (basic check for URL extension) ---
+        is_likely_binary = any(url.lower().endswith(ext) for ext in
+                                 ['.jpg', '.jpeg', '.png', '.gif', '.bmp', '.pdf', '.zip', '.gz', '.webp', '.svg',
+                                  '.mp4', '.mov', '.avi', '.mp3', '.wav'])
+        
+        if is_likely_binary and not dynamic: # For static, we can be more certain. Dynamic might wrap it.
+             logger.info(f"L'URL {url} semble pointer vers un fichier binaire/image (vérification par extension). "
+                         f"Extraction de contenu HTML structuré sera probablement ignorée.")
+             # Attempt to fetch anyway, content_type will confirm
+        
+        if dynamic:
+            html_content = await scrape_dynamic_page(url, wait_time, wait_for_selector)
+            # For dynamic content, we assume it's HTML-like as Playwright renders it.
+            # If the URL was a direct image, Playwright might wrap it in a simple HTML.
+        else:
+            html_content, content_type_header = await scrape_static_page(url)
+            if content_type_header and not any(ct in content_type_header for ct in ['text/html', 'application/xhtml+xml', 'application/xml']):
+                logger.warning(f"Contenu non-HTML (type: {content_type_header}) détecté pour {url} via requête statique. "
+                                f"Extraction de texte/liens/images HTML sera limitée.")
+                # Create metadata and save what we have (e.g., the raw content if it's text-based, or just URL)
+                metadata = {"url": url, "scrape_time": datetime.now().isoformat(), "title": os.path.basename(urlparse(url).path), "content_type": content_type_header}
+                result_data = {"metadata": metadata}
+                if "text/" in content_type_header: # if it's some form of text
+                     result_data["text"] = html_content # Store the raw text
+                
+                filename_base = get_safe_filename(url, filename_prefix)
+                saved_files = await save_scraped_data(result_data, output_path, filename_base, save_individual_metadata=save_individual_metadata) # Pass the new flag
+                result_data["saved_files"] = saved_files
+                return result_data
+
+        if not html_content:
+            logger.warning(f"Aucun contenu HTML récupéré pour {url}.")
+            return {"url": url, "error": "Aucun contenu HTML récupéré."}
+
+        soup = BeautifulSoup(html_content, 'html.parser')
+        metadata = extract_metadata(soup, url) # Extract metadata from the whole page first
+        
+        target_soup = soup # This will be the soup used for extraction (either full or selected part)
+
+        # --- Solution Part 3: Refined CSS selector logic ---
+        if css_selector: # This is after "string" has been handled (set to None)
+            selected_elements = soup.select(css_selector)
+            if not selected_elements:
+                logger.warning(f"Aucun contenu trouvé avec le sélecteur CSS spécifié: '{css_selector}' pour {url}. "
+                                f"Le contenu de la page entière sera utilisé pour l'extraction.")
+                # target_soup remains the original full soup, which is the desired fallback
+            else:
+                logger.info(f"Contenu trouvé et filtré avec le sélecteur '{css_selector}' pour {url}.")
+                selected_html_snippet = "".join(str(el) for el in selected_elements)
+                target_soup = BeautifulSoup(selected_html_snippet, 'html.parser')
+        
+        result = {"metadata": metadata, "html": html_content} # Always save original full HTML
+
+        # Perform extractions using the target_soup (which is either full page or selected part)
+        if extract_text:
+            text_extraction_soup = BeautifulSoup(str(target_soup), 'html.parser')
+            for script_or_style in text_extraction_soup(["script", "style"]):
+                script_or_style.extract()
+            text = text_extraction_soup.get_text(separator="\n", strip=True)
+            text = re.sub(r'\n\s*\n+', '\n', text) # Consolidate multiple newlines
+            text = re.sub(r' +', ' ', text) # Consolidate multiple spaces
+            result["text"] = text.strip()
+        
+        if extract_markdown:
+            markdown_content = html_to_markdown(str(target_soup))
+            result["markdown"] = markdown_content
+        
+        if extract_links:
+            links = []
+            for a_tag in target_soup.find_all('a', href=True):
+                href = a_tag['href']
+                absolute_url = urljoin(url, href) # Base URL for resolving relative links is the original page URL
+                link_text = a_tag.get_text(strip=True) or "[Lien sans texte]"
+                links.append({"url": absolute_url, "text": link_text})
+            result["links"] = links
+            
+        if extract_images:
+            images = []
+            for img_tag in target_soup.find_all('img'):
+                src = img_tag.get('src')
+                if src: # Ensure src attribute exists
+                    absolute_src = urljoin(url, src) # Base URL for resolving relative links
+                    alt_text = img_tag.get('alt', '').strip()
+                    images.append({"src": absolute_src, "alt": alt_text})
+            result["images"] = images
+            
+        filename_base = get_safe_filename(url, filename_prefix)
+        saved_files = await save_scraped_data(result, output_path, filename_base, save_individual_metadata=save_individual_metadata) # Pass the new flag
+        result["saved_files"] = saved_files
+        
+        return result
+    
+    except HTTPException as he: # Re-raise HTTPExceptions from called functions
+        logger.error(f"HTTPException lors du scraping de {url}: {he.detail}")
+        return {"url": url, "error": f"HTTPException: {he.status_code} - {he.detail}"}
+    except Exception as e:
+        import traceback
+        logger.error(f"Erreur inattendue lors du scraping de {url}: {str(e)}\n{traceback.format_exc()}")
+        return {"url": url, "error": str(e), "traceback": traceback.format_exc()}
+
 @app.post("/scrape-site")
 async def scrape_site_endpoint(
     request: ScrapeRequest, # Use ScrapeRequest for a single site base URL
     discovery_depth: int = Query(1, description="Profondeur de découverte des URLs du site (0-3)", ge=0, le=3),
 ):
     if not re.match(r'^https?://', request.url):
-        raise HTTPException(status_code=400, 
+        raise HTTPException(status_code=400,
                             detail=f"URL de base invalide: {request.url}. Doit commencer par http:// ou https://")
     
     logger.info(f"Début du scraping du site: {request.url} avec profondeur de découverte: {discovery_depth}")
@@ -476,14 +460,15 @@ async def scrape_site_endpoint(
         output_path=request.output_path,
         dynamic=request.dynamic,
         wait_time=request.wait_time,
-        wait_for_selector=request.wait_for_selector, # This might be the "string" if not careful
+        wait_for_selector=request.wait_for_selector,
         extract_links=request.extract_links,
         extract_images=request.extract_images,
         extract_text=request.extract_text,
         extract_markdown=request.extract_markdown,
-        css_selector=request.css_selector, # This might be the "string"
+        css_selector=request.css_selector,
         filename_prefix=request.filename_prefix or urlparse(request.url).netloc.replace("www.",""), # Default prefix from domain
-        max_pages=request.max_pages 
+        max_pages=request.max_pages,
+        save_individual_metadata=False # Set to False for site-wide scrapes
     )
     
     logger.info(f"Lancement du scraping multiple pour {len(url_list)} URLs découvertes.")
@@ -510,12 +495,11 @@ async def scrape_endpoint(request: ScrapeRequest):
         extract_images=request.extract_images,
         extract_text=request.extract_text,
         extract_markdown=request.extract_markdown,
-        css_selector=request.css_selector, # This is where "string" could be passed
-        filename_prefix=request.filename_prefix
+        css_selector=request.css_selector,
+        filename_prefix=request.filename_prefix,
+        save_individual_metadata=True # Default to True for single page scrapes
     )
     if "error" in result:
-        # Consider raising HTTPException for errors to give proper HTTP status codes
-        # For now, returning JSON with error details
         logger.error(f"Erreur pour {request.url}: {result.get('error')}")
     return result
 
@@ -531,12 +515,10 @@ async def scrape_multiple_endpoint(request: MultiScrapeRequest):
             valid_urls.append(u)
 
     if not valid_urls:
-        # If all URLs were invalid or list was empty
         if invalid_url_details:
              raise HTTPException(status_code=400, detail={"message": "Aucune URL valide fournie.", "errors": invalid_url_details})
         else:
              raise HTTPException(status_code=400, detail="Aucune URL fournie pour le scraping.")
-
 
     urls_to_scrape = valid_urls
     if len(valid_urls) > request.max_pages:
@@ -547,9 +529,9 @@ async def scrape_multiple_endpoint(request: MultiScrapeRequest):
     
     semaphore = asyncio.Semaphore(request.parallel_workers)
     
-    async def scrape_with_semaphore(url_to_scrape: str): # Renamed variable
+    async def scrape_with_semaphore(url_to_scrape: str):
         async with semaphore:
-            return await scrape_page( # Ensure all parameters are passed correctly
+            return await scrape_page(
                 url=url_to_scrape,
                 output_path=request.output_path,
                 dynamic=request.dynamic,
@@ -559,12 +541,13 @@ async def scrape_multiple_endpoint(request: MultiScrapeRequest):
                 extract_images=request.extract_images,
                 extract_text=request.extract_text,
                 extract_markdown=request.extract_markdown,
-                css_selector=request.css_selector, # This is where "string" could be passed
-                filename_prefix=request.filename_prefix
+                css_selector=request.css_selector,
+                filename_prefix=request.filename_prefix,
+                save_individual_metadata=request.save_individual_metadata # Pass the new flag
             )
             
     tasks = [scrape_with_semaphore(u) for u in urls_to_scrape]
-    results = await asyncio.gather(*tasks, return_exceptions=False) # Errors are handled inside scrape_page
+    results = await asyncio.gather(*tasks, return_exceptions=False)
 
     processed_results = {}
     successful_count = 0
@@ -572,16 +555,14 @@ async def scrape_multiple_endpoint(request: MultiScrapeRequest):
 
     for res in results:
         if isinstance(res, dict) and "url" in res:
-            processed_results[res["url"]] = {k: v for k, v in res.items() if k != "url"} # Store details under URL key
+            processed_results[res["url"]] = {k: v for k, v in res.items() if k != "url"}
             if "error" in res:
                 failed_count += 1
             else:
                 successful_count += 1
         else:
-            # This case should ideally not happen if scrape_page always returns a dict with 'url'
             logger.error(f"Résultat de scraping inattendu: {res}")
-            failed_count +=1 # Count as failure
-
+            failed_count +=1
 
     report_data = {
         "scrape_start_time": datetime.now().isoformat(),
@@ -592,7 +573,7 @@ async def scrape_multiple_endpoint(request: MultiScrapeRequest):
         "successful_scrapes": successful_count,
         "failed_scrapes": failed_count,
         "output_path": request.output_path,
-        "details": processed_results,
+        "details": processed_results, # This contains all individual page metadata
         "invalid_url_reports": invalid_url_details
     }
     
@@ -616,7 +597,7 @@ async def scrape_multiple_endpoint(request: MultiScrapeRequest):
 async def root():
     return {
         "message": "Web Scraper API",
-        "version": "2.1", # Updated version
+        "version": "2.1",
         "endpoints": [
             {"path": "/scrape", "method": "POST", "description": "Scraper une seule page web."},
             {"path": "/scrape-multiple", "method": "POST", "description": "Scraper plusieurs pages web."},
@@ -626,5 +607,4 @@ async def root():
 
 if __name__ == "__main__":
     import uvicorn
-    # Ensure correct app object is passed if filename is different, e.g., main:app
-    uvicorn.run("dynamic_crawl:app", host="0.0.0.0", port=8000, reload=True) # Replace your_filename
+    uvicorn.run("dynamic_crawl:app", host="0.0.0.0", port=8000, reload=True)
