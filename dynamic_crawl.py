@@ -428,7 +428,7 @@ async def save_scraped_data(data: Dict[str, Any], output_path: str, filename_bas
 
 async def scrape_site_endpoint(
     request: ScrapeRequest,
-    discovery_depth: int = Query(1, description="Profondeur de découverte des URLs du site (0-3)", ge=0, le=3),
+    discovery_depth: int = Query(3, description="Profondeur de découverte des URLs du site (0-3)", ge=0, le=3),
 ):
     if not re.match(r'^https?://', request.url):
         raise HTTPException(status_code=400, detail=f"URL de base invalide: {request.url}")
