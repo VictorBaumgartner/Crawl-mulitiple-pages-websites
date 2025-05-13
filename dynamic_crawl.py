@@ -360,10 +360,14 @@ def extract_metadata(soup: BeautifulSoup, url: str) -> Dict[str, Any]:
 async def save_scraped_data(data: Dict[str, Any], output_path: str, filename_base: str) -> Dict[str, str]:
     saved_files = {}
 
+    # Ensure output directory exists
     Path(output_path).mkdir(parents=True, exist_ok=True)
 
+    # Define path for the single website metadata file
+    metadata_path = os.path.join(output_path, "website_metadata.json")
+
+    # Initialize metadata structure
     metadata_to_save = {
-        "url": data.get("metadata", {}).get("url", ""),
         "scrape_time": data.get("metadata", {}).get("scrape_time", ""),
         "title": data.get("metadata", {}).get("title"),
         "description": data.get("metadata", {}).get("description"),
@@ -371,14 +375,45 @@ async def save_scraped_data(data: Dict[str, Any], output_path: str, filename_bas
         "author": data.get("metadata", {}).get("author"),
         "og_tags": data.get("metadata", {}).get("og_tags", {}),
         "twitter_tags": data.get("metadata", {}).get("twitter_tags", {}),
-        "links": data.get("links", []),
-        "images": data.get("images", [])
+        "links": [],
+        "images": []
     }
-    metadata_path = os.path.join(output_path, f"{filename_base}_metadata.json")
+
+    # Load existing metadata if it exists
+    existing_links = set()
+    existing_images = set()
+    if os.path.exists(metadata_path):
+        async with aiofiles.open(metadata_path, mode='r', encoding='utf-8') as f:
+            existing_metadata = json.loads(await f.read())
+            existing_links = set(tuple(link.items()) if isinstance(link, dict) else link for link in existing_metadata.get("links", []))
+            existing_images = set(tuple(img.items()) if isinstance(img, dict) else img for img in existing_metadata.get("images", []))
+            # Preserve existing metadata fields
+            metadata_to_save.update({
+                "scrape_time": existing_metadata.get("scrape_time", metadata_to_save["scrape_time"]),
+                "title": existing_metadata.get("title", metadata_to_save["title"]),
+                "description": existing_metadata.get("description", metadata_to_save["description"]),
+                "keywords": existing_metadata.get("keywords", metadata_to_save["keywords"]),
+                "author": existing_metadata.get("author", metadata_to_save["author"]),
+                "og_tags": existing_metadata.get("og_tags", metadata_to_save["og_tags"]),
+                "twitter_tags": existing_metadata.get("twitter_tags", metadata_to_save["twitter_tags"])
+            })
+
+    # Add new links and images, ensuring uniqueness
+    new_links = data.get("links", [])
+    new_images = data.get("images", [])
+    # Convert new links and images to sets of tuples for comparison
+    new_links_set = set(tuple(link.items()) if isinstance(link, dict) else link for link in new_links)
+    new_images_set = set(tuple(img.items()) if isinstance(img, dict) else img for img in new_images)
+    # Update metadata with unique links and images
+    metadata_to_save["links"] = [dict(link) if isinstance(link, tuple) else link for link in existing_links.union(new_links_set)]
+    metadata_to_save["images"] = [dict(img) if isinstance(img, tuple) else img for img in existing_images.union(new_images_set)]
+
+    # Save the updated metadata
     async with aiofiles.open(metadata_path, mode='w', encoding='utf-8') as f:
         await f.write(json.dumps(metadata_to_save, ensure_ascii=False, indent=4))
     saved_files["metadata"] = metadata_path
 
+    # Save markdown file if present
     if data.get("markdown"):
         md_path = os.path.join(output_path, f"{filename_base}.md")
         async with aiofiles.open(md_path, mode='w', encoding='utf-8') as f:
@@ -545,4 +580,4 @@ async def root():
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("web_scraper:app", host="0.0.0.0", port=8000, reload=True)
+    uvicorn.run("dynamic_crawl:app", host="0.0.0.0", port=8000, reload=True)
