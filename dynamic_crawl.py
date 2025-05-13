@@ -124,7 +124,7 @@ async def scrape_dynamic_page(url: str, wait_time: int = 5, wait_for_selector: O
         @retry_policy
         async def attempt_navigation():
             try:
-                await page.goto(url, wait_until="networkidle", timeout=60000)
+                await page.goto(url, wait_until="networkidle", timeout=120000)
                 if wait_for_selector:
                     await page.wait_for_selector(wait_for_selector, timeout=wait_time * 1000)
                 else:
