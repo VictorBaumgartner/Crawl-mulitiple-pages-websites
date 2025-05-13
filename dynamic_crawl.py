@@ -216,17 +216,24 @@ async def scrape_page(
         if extract_text:
             text_soup = BeautifulSoup(str(target_soup), 'html.parser')
             for script_or_style in text_soup(["script", "style"]):
-                script_or_style
+                script_or_style.extract()
+            text = text_soup.get_text(separator="\n", strip=True)
+            text = re.sub(r'\n\s*\n+', '\n', text) # Consolidate multiple newlines
+            text = re.sub(r' +', ' ', text) # Consolidate multiple spaces
+            result["text"] = text.strip()
 
         if extract_markdown:
             result["markdown"] = html_to_markdown(str(target_soup))
 
         if extract_links:
-            links = [{"url": urljoin(url, a['href']), "text": a.get_text(strip=True) or "[Lien sans texte]", "source_page": url}
-                     for a in target_soup.find_all('a', href=True)]
+            links = []
+            for a_tag in target_soup.find_all('a', href=True):
+                href = a_tag['href']
+                absolute_url = urljoin(url, href) # Base URL for resolving relative links is the original page URL
+                link_text = a_tag.get_text(strip=True) or "[Lien sans texte]"
+                links.append({"url": absolute_url, "text": link_text})
             result["links"] = links
-            logger.info(f"Extrait {len(links)} liens de {url}")
-
+            
         if extract_images:
             images = [{"src": urljoin(url, img.get('src', '')), "alt": img.get('alt', '').strip(), "source_page": url}
                       for img in target_soup.find_all('img') if img.get('src')]
