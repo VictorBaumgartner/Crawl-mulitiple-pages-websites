@@ -84,7 +84,7 @@ async def crawl_website(start_url, output_dir=r"C:\Users\victo\Desktop\crawl\cra
         filename = re.sub(r'[<>:"/\\|?*]', '_', filename)
         return filename[:200]
 
-    async def crawl_page(current_url):
+    async def crawl_page(current_url, current_depth):
         #if len(visited_urls) >= max_pages:
         #    return
 
@@ -111,26 +111,37 @@ async def crawl_website(start_url, output_dir=r"C:\Users\victo\Desktop\crawl\cra
                         f.write(f"# {current_url}\n\n{cleaned_markdown}\n")
                     print(f"Saved cleaned Markdown to: {output_path}")
 
-                    internal_links = result.links.get("internal", [])
-                    for link in internal_links:
-                        href = link["href"]
-                        absolute_url = urljoin(current_url, href)
-                        if urlparse(absolute_url).netloc == urlparse(start_url).netloc:
-                            if absolute_url not in visited_urls and absolute_url not in queued_urls:
-                                crawl_queue.put_nowait(absolute_url)
-                                queued_urls.add(absolute_url)
+
+                    if current_depth < max_depth:
+                        internal_links = result.links.get("internal", [])
+                        for link in internal_links:
+                            href = link["href"]
+                            absolute_url = urljoin(current_url, href)
+                            if urlparse(absolute_url).netloc == urlparse(start_url).netloc:
+                                if absolute_url not in visited_urls and absolute_url not in queued_urls:
+                                    crawl_queue.put_nowait((absolute_url, current_depth + 1))
+                                    queued_urls.add(absolute_url)
                 else:
                     print(f"Failed to crawl {current_url}: {result.error_message}")
 
+                #     internal_links = result.links.get("internal", [])
+                #     for link in internal_links:
+                #         href = link["href"]
+                #         absolute_url = urljoin(current_url, href)
+                #         if urlparse(absolute_url).netloc == urlparse(start_url).netloc:
+                #             if absolute_url not in visited_urls and absolute_url not in queued_urls:
+                #                 crawl_queue.put_nowait(absolute_url)
+                #                 queued_urls.add(absolute_url)
+                # else:
+                #     print(f"Failed to crawl {current_url}: {result.error_message}")
+
     async def worker():
         while not crawl_queue.empty():
-            current_url = await crawl_queue.get()
-            await crawl_page(current_url)
+            current_url, current_depth = await crawl_queue.get()
+            await crawl_page(current_url, current_depth)
             crawl_queue.task_done()
 
-    tasks = []
-    for _ in range(max_concurrency):
-        tasks.append(asyncio.create_task(worker()))
+    tasks = [asyncio.create_task(worker()) for _ in range(max_concurrency)]
 
     await crawl_queue.join()
 
@@ -143,8 +154,8 @@ async def crawl_website(start_url, output_dir=r"C:\Users\victo\Desktop\crawl\cra
     print(f"Metadata saved to {metadata_path}")
 
 async def main():
-    target_url = "https://www.harfleur.fr/equipements_culturels_et_sportifs.html"
-    output_dir = r"C:\Users\victo\Desktop\crawl\crawl_output2\equipements_culturels_et_sportifs-harfleur"
+    target_url = "https://www.saint-quentin.fr/109-musee-lecuyer.htm"
+    output_dir = r"C:\Users\victo\Desktop\crawl\crawl_output2\musee-lecuyer-saint-quentin"
     await crawl_website(
         start_url=target_url,
         output_dir=output_dir,
