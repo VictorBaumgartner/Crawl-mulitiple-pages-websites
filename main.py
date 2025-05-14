@@ -48,7 +48,7 @@ def clean_markdown(md_text):
     
     return md_text.strip()
 
-async def crawl_website(start_url, output_dir=r"C:\Users\victo\Desktop\crawl\crawl_output", max_concurrency=8):
+async def crawl_website(start_url, output_dir=r"C:\Users\victo\Desktop\crawl\crawl_output", max_concurrency=8, max_depth=2):
     """
     Crawl a website deeply and save each page as a cleaned Markdown file, with parallelization.
     """
@@ -72,8 +72,9 @@ async def crawl_website(start_url, output_dir=r"C:\Users\victo\Desktop\crawl\cra
     visited_urls = set()
     queued_urls = set()
     crawl_queue = asyncio.Queue()
-    crawl_queue.put_nowait(start_url)
+    #crawl_queue.put_nowait(start_url)
     semaphore = asyncio.Semaphore(max_concurrency)
+    crawl_queue.put_nowait((start_url, 0))  # ← Stocke aussi la profondeur initiale
 
     def sanitize_filename(url):
         parsed = urlparse(url)
@@ -142,12 +143,13 @@ async def crawl_website(start_url, output_dir=r"C:\Users\victo\Desktop\crawl\cra
     print(f"Metadata saved to {metadata_path}")
 
 async def main():
-    target_url = "https://www.rambolitrain.com/"
-    output_dir = r"C:\Users\victo\Desktop\crawl\crawl_output2\rambolitrain"
+    target_url = "https://www.harfleur.fr/equipements_culturels_et_sportifs.html"
+    output_dir = r"C:\Users\victo\Desktop\crawl\crawl_output2\equipements_culturels_et_sportifs-harfleur"
     await crawl_website(
         start_url=target_url,
         output_dir=output_dir,
-        max_concurrency=20
+        max_concurrency=20,
+        max_depth=2
     )
 
 if __name__ == "__main__":
