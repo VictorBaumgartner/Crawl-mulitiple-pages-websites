@@ -151,7 +151,6 @@
 
 
 
-
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from pydantic import BaseModel, Field
 import asyncio
@@ -181,29 +180,17 @@ def clean_markdown(md_text: str) -> str:
     """
     Cleans Markdown content by removing or modifying specific elements.
     """
-    # Remove image links/tags first
     md_text = re.sub(r'!\[([^\]]*)\]\((http[s]?://[^\)]+)\)', '', md_text)
-    # Remove inline links, keeping the link text
     md_text = re.sub(r'\[([^\]]+)\]\((http[s]?://[^\)]+)\)', r'\1', md_text)
-    # Remove raw URLs (handle common cases, avoid removing parts of valid markdown)
     md_text = re.sub(r'(?<!\]\()https?://\S+', '', md_text)
-    # Remove footnote references ([^1])
     md_text = re.sub(r'\[\^?\d+\]', '', md_text)
-    # Remove footnote definitions (e.g., [^1]: http://example.com)
     md_text = re.sub(r'^\[\^?\d+\]:\s?.*$', '', md_text, flags=re.MULTILINE)
-    # Remove blockquotes
     md_text = re.sub(r'^\s{0,3}>\s?', '', md_text, flags=re.MULTILINE)
-    # Remove bold markdown
     md_text = re.sub(r'(\*\*|__)(.*?)\1', r'\2', md_text)
-    # Remove italic markdown
     md_text = re.sub(r'(\*|_)(.*?)\1', r'\2', md_text)
-    # Remove empty headings (lines starting with # followed only by whitespace)
     md_text = re.sub(r'^\s*#+\s*$', '', md_text, flags=re.MULTILINE)
-    # Remove empty parentheses that might remain from link removal
     md_text = re.sub(r'\(\)', '', md_text)
-    # Compact multiple newlines into single newlines
     md_text = re.sub(r'\n\s*\n+', '\n\n', md_text)
-    # Compact multiple spaces/tabs into single spaces
     md_text = re.sub(r'[ \t]+', ' ', md_text)
     return md_text.strip()
 
@@ -213,7 +200,7 @@ def read_urls_from_csv(csv_content: str) -> List[str]:
     csvfile = io.StringIO(csv_content)
     reader = csv.reader(csvfile)
     for i, row in enumerate(reader):
-        if not row:  # Skip empty rows
+        if not row:
             continue
         url = row[0].strip()
         if url and (url.startswith("http://") or url.startswith("https://")):
@@ -230,18 +217,23 @@ def read_urls_from_csv(csv_content: str) -> List[str]:
     return urls
 
 def sanitize_filename(url: str) -> str:
-    """Sanitizes a URL to create a safe filename."""
+    """Sanitizes a URL to create a safe and shorter filename."""
     try:
         parsed = urlparse(url)
         netloc = parsed.netloc.replace(".", "_")
         path = parsed.path.strip("/").replace("/", "_").replace(".", "_")
         if not path:
             path = "index"
-        query = parsed.query.replace("=", "-").replace("&", "_")
+
+        # Limit query parameter inclusion to avoid overly long filenames
+        query = parsed.query
         if query:
-            filename = f"{netloc}_{path}_{query}"  # No .md suffix yet
+            # Take only the first 50 chars of query to prevent long filenames
+            query = query[:50]
+            query = query.replace("=", "-").replace("&", "_")
+            filename = f"{netloc}_{path}_{query}"
         else:
-            filename = f"{netloc}_{path}"  # No .md suffix yet
+            filename = f"{netloc}_{path}"
 
         filename = re.sub(r'[<>:"/\\|?*]', '_', filename)
         filename = re.sub(r'[\s\._-]+', '_', filename)
@@ -249,9 +241,9 @@ def sanitize_filename(url: str) -> str:
         filename = re.sub(r'_+$', '', filename)
 
         if not filename:
-            filename = f"url_{abs(hash(url))}"  # No .md suffix yet
+            filename = f"url_{abs(hash(url))}"
 
-        max_len_without_suffix = 200 - 3  # Leave space for .md
+        max_len_without_suffix = 150 - 3  # Reduced to avoid path length issues
         filename = filename[:max_len_without_suffix] + ".md"
 
         return filename
@@ -272,12 +264,12 @@ def sanitize_dirname(url: str) -> str:
         if not dirname:
             dirname = f"domain_{abs(hash(url))}"
 
-        return dirname[:200]
+        return dirname[:150]
     except Exception as e:
         print(f"Error sanitizing URL directory name for {url}: {e}")
         return f"domain_error_{abs(hash(url))}"
 
-CrawlQueueItem = Tuple[str, int, str, str]  # (url, depth, start_domain, site_output_dir)
+CrawlQueueItem = Tuple[str, int, str, str]
 
 async def crawl_website_single_site(
     start_url: str,
@@ -306,8 +298,20 @@ async def crawl_website_single_site(
         site_subdir_name = sanitize_dirname(start_url)
         site_output_path = os.path.join(output_dir, site_subdir_name)
 
+        # Convert to absolute path for debugging
+        site_output_path = os.path.abspath(site_output_path)
         print(f"Crawl limited to domain: {start_domain}")
         print(f"Saving files for this site in: {site_output_path}")
+
+        # Verify directory creation
+        try:
+            os.makedirs(site_output_path, exist_ok=True)
+            if not os.path.exists(site_output_path):
+                raise OSError(f"Failed to create directory: {site_output_path}")
+        except Exception as e:
+            results["failed"].append({"url": start_url, "error": f"Cannot create output directory: {e}"})
+            print(f"Error creating output directory {site_output_path}: {e}")
+            return results
 
     except Exception as e:
         results["failed"].append({"url": start_url, "error": f"Error parsing start URL or determining output path: {e}"})
@@ -360,10 +364,6 @@ async def crawl_website_single_site(
                 print(f"Crawling ({len(crawled_urls)}): {current_url} (Depth: {current_depth})")
 
                 filename = sanitize_filename(current_url)
-                max_filename_len = 200
-                if len(filename) > max_filename_len:
-                    filename = filename[:max_filename_len]
-
                 output_path = os.path.join(current_site_output_path, filename)
 
                 if any(keyword in filename.lower() for keyword in EXCLUDE_KEYWORDS):
@@ -400,11 +400,20 @@ async def crawl_website_single_site(
                         cleaned_markdown = clean_markdown(markdown_content)
 
                         try:
-                            os.makedirs(os.path.dirname(output_path), exist_ok=True)
+                            # Verify write permissions
+                            if not os.access(current_site_output_path, os.W_OK):
+                                raise OSError(f"No write permission for directory: {current_site_output_path}")
+
+                            # Write file and verify
                             with open(output_path, "w", encoding="utf-8") as f:
                                 f.write(f"# {current_url}\n\n{cleaned_markdown}\n")
-                            print(f"Saved cleaned Markdown to: {output_path}")
-                            results["success"].append(current_url)
+                            
+                            # Verify file exists
+                            if os.path.exists(output_path):
+                                print(f"Saved cleaned Markdown to: {output_path}")
+                                results["success"].append(current_url)
+                            else:
+                                raise IOError(f"File was not created: {output_path}")
 
                             if current_depth < max_depth:
                                 internal_links = result.links.get("internal", [])
@@ -419,7 +428,7 @@ async def crawl_website_single_site(
                                                 queued_urls.add(absolute_url)
                                     except Exception as link_e:
                                         print(f"Error processing link {href} from {current_url}: {link_e}")
-                        except IOError as e:
+                        except (IOError, OSError) as e:
                             print(f"Error saving file {output_path}: {e}")
                             results["failed"].append({"url": current_url, "error": f"File save error: {e}"})
                         except Exception as e:
@@ -434,20 +443,16 @@ async def crawl_website_single_site(
                 print(f"Error in crawl_page worker: {e}")
                 crawl_queue.task_done()
 
-    # Create initial worker tasks
     worker_tasks = []
     for _ in range(max_concurrency):
         task = asyncio.create_task(crawl_page())
         worker_tasks.append(task)
 
-    # Wait for the queue to be fully processed
     await crawl_queue.join()
 
-    # Cancel any remaining tasks
     for task in worker_tasks:
         task.cancel()
 
-    # Wait for tasks to complete or be cancelled
     await asyncio.gather(*worker_tasks, return_exceptions=True)
 
     print(f"Finished crawl for: {start_url}")
@@ -474,6 +479,7 @@ async def crawl_csv_upload_endpoint(
         if not urls_to_crawl:
             return {"status": "warning", "message": "No valid URLs found in the CSV file to crawl."}
 
+        output_dir = os.path.abspath(output_dir)  # Convert to absolute path
         os.makedirs(output_dir, exist_ok=True)
 
         overall_results: Dict[str, Any] = {
