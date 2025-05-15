@@ -154,8 +154,8 @@ async def crawl_website(start_url, output_dir=r"C:\Users\victo\Desktop\crawl\cra
     print(f"Metadata saved to {metadata_path}")
 
 async def main():
-    target_url = "https://www.saint-quentin.fr/109-musee-lecuyer.htm"
-    output_dir = r"C:\Users\victo\Desktop\crawl\crawl_output2\musee-lecuyer-saint-quentin"
+    target_url = "https://www.martinique.org/node/24376/PCUMAR972V5000OU/detail/riviere-pilote/ecomusee"
+    output_dir = r"C:\Users\victo\Desktop\crawl\crawl_output2\ecomusee-martinique"
     await crawl_website(
         start_url=target_url,
         output_dir=output_dir,
