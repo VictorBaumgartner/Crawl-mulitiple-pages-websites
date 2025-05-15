@@ -297,7 +297,7 @@ async def crawl_website_single_site(
         cache_mode="BYPASS", # Always fetch fresh content
         exclude_external_links=True, # Only follow links within the starting domain
         exclude_social_media_links=True,
-        limit_urls_to_domain=True # Explicitly limit to the domain of the start_url
+        limit_to_domain=True # Explicitly limit to the domain of the start_url
     )
 
     async def crawl_page(current_url: str, current_depth: int):
