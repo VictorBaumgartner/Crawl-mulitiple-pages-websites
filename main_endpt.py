@@ -281,7 +281,6 @@ async def crawl_website_single_site(
         results["failed"].append({"url": "N/A", "error": "Empty start URL provided"})
         return results
 
-
     print(f"Starting crawl for: {start_url} with max_depth={max_depth}, max_concurrency={max_concurrency}")
 
     md_generator = DefaultMarkdownGenerator(
@@ -297,7 +296,7 @@ async def crawl_website_single_site(
         cache_mode="BYPASS", # Always fetch fresh content
         exclude_external_links=True, # Only follow links within the starting domain
         exclude_social_media_links=True,
-        limit_to_domain=True # Explicitly limit to the domain of the start_url
+        stay_in_domain=True # Explicitly limit to the domain of the start_url
     )
 
     async def crawl_page(current_url: str, current_depth: int):
@@ -381,19 +380,19 @@ async def crawl_website_single_site(
             crawl_queue.task_done() # Mark task done after processing
 
     # Create worker tasks
-    tasks = [asyncio.create_task(crawl_page(*await crawl_queue.get())) for _ in range(max_concurrency)]
+    # Ensure we don't try to create more tasks than queue items if queue is small initially
+    worker_tasks = [asyncio.create_task(crawl_page(*await crawl_queue.get())) for _ in range(min(max_concurrency, crawl_queue.qsize()))]
 
     # Wait for all tasks in the queue to be processed
     await crawl_queue.join()
 
     # Cancel remaining worker tasks (they might be waiting for queue items that won't come)
-    for task in tasks:
-        task.cancel()
-    # Await cancellation to avoid warnings
-    try:
-        await asyncio.gather(*tasks, return_exceptions=True)
-    except asyncio.CancelledError:
-        pass # Expected during cancellation
+    for task in worker_tasks:
+        if not task.done(): # Only cancel if not already finished
+            task.cancel()
+
+    # Await cancellation to avoid warnings and clean up
+    await asyncio.gather(*worker_tasks, return_exceptions=True)
 
     print(f"Finished crawl for: {start_url}")
     return results
