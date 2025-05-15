@@ -149,6 +149,8 @@
 #     uvicorn.run(app, host="0.0.0.0", port=8002)
 
 
+
+
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from pydantic import BaseModel, Field
 import asyncio
@@ -161,10 +163,11 @@ from crawl4ai.markdown_generation_strategy import DefaultMarkdownGenerator
 from typing import List, Dict, Any
 import csv
 import io
+import uvicorn # Import uvicorn here for the main block
 
 app = FastAPI()
 
-# Define the exclusion keywords for filenames
+# Define the exclusion keywords for filenames (case-insensitive check will be used)
 EXCLUDE_KEYWORDS = ['pdf', 'jpeg', 'jpg', 'png', 'webp']
 
 class CrawlCSVRequest(BaseModel):
@@ -176,18 +179,14 @@ class CrawlCSVRequest(BaseModel):
 
 def clean_markdown(md_text: str) -> str:
     """
-    Cleans Markdown content by:
-    - Removing inline links, footnotes, raw URLs, images
-    - Removing bold, italic, blockquotes
-    - Removing empty headings
-    - Compacting whitespace
+    Cleans Markdown content by removing or modifying specific elements.
     """
     # Remove image links/tags first
     md_text = re.sub(r'!\[([^\]]*)\]\((http[s]?://[^\)]+)\)', '', md_text)
     # Remove inline links, keeping the link text
     md_text = re.sub(r'\[([^\]]+)\]\((http[s]?://[^\)]+)\)', r'\1', md_text)
-    # Remove raw URLs
-    md_text = re.sub(r'(?<!\]\()http[s]?://\S+', '', md_text) # Avoid removing URLs inside markdown links already handled
+    # Remove raw URLs (handle common cases, avoid removing parts of valid markdown)
+    md_text = re.sub(r'(?<!\]\()https?://\S+', '', md_text)
     # Remove footnote references ([^1])
     md_text = re.sub(r'\[\^?\d+\]', '', md_text)
     # Remove footnote definitions (e.g., [^1]: http://example.com)
@@ -217,13 +216,20 @@ def read_urls_from_csv(csv_content: str) -> List[str]:
     # although simple splitlines works for very basic cases.
     # Assuming simple list of URLs, one per row, no headers.
     reader = csv.reader(csvfile)
-    for row in reader:
-        if row: # Check if row is not empty
-            url = row[0].strip() # Take the first column and remove leading/trailing whitespace
-            if url and (url.startswith("http://") or url.startswith("https://")):
+    for i, row in enumerate(reader):
+        if not row: # Skip empty rows
+            continue
+        url = row[0].strip() # Take the first column and remove leading/trailing whitespace
+        # Basic URL validation
+        if url and (url.startswith("http://") or url.startswith("https://")):
+            try:
+                # Attempt to parse to catch malformed URLs before adding
+                urlparse(url)
                 urls.append(url)
-            else:
-                print(f"Skipping invalid or empty URL: {row}")
+            except Exception:
+                 print(f"Skipping invalid URL format on line {i+1}: '{row[0]}'")
+        else:
+            print(f"Skipping non-HTTP/HTTPS or empty entry on line {i+1}: '{row[0]}'")
     return urls
 
 def sanitize_filename(url: str) -> str:
@@ -236,7 +242,8 @@ def sanitize_filename(url: str) -> str:
         if not path:
             path = "index"
         # Include query parameters if any, might help distinguish pages
-        query = parsed.query.replace("=", "_").replace("&", "__")
+        # Simplify query string for filenames
+        query = parsed.query.replace("=", "-").replace("&", "_")
         if query:
              filename = f"{netloc}_{path}_{query}.md"
         else:
@@ -244,17 +251,21 @@ def sanitize_filename(url: str) -> str:
 
         # Remove any characters still unsafe or problematic
         filename = re.sub(r'[<>:"/\\|?*]', '_', filename)
-        # Ensure filename doesn't start or end with a dot or underscore multiple times
-        filename = re.sub(r'^[\._]+', '', filename)
-        filename = re.sub(r'[\._]+$', '', filename)
+        # Ensure filename doesn't start or end with specific characters or have multiple consecutive ones
+        filename = re.sub(r'[\s\._-]+', '_', filename) # Replace spaces, dots, underscores, hyphens with single underscore
+        filename = re.sub(r'^_+', '', filename) # Remove leading underscores
+        filename = re.sub(r'_+$', '', filename) # Remove trailing underscores
 
-        # Prevent overly long filenames
-        return filename[:200]
+        if not filename: # Fallback if sanitization results in empty string
+             filename = f"url_{abs(hash(url))}.md" # Use a hash as a unique identifier
+
+        # Prevent overly long filenames (most file systems have limits, e.g., 255 chars)
+        return filename[:200] + ".md" if not filename.lower().endswith(".md") else filename[:200]
 
     except Exception as e:
         print(f"Error sanitizing URL {url}: {e}")
         # Fallback filename if sanitization fails
-        return f"error_parsing_{hash(url)}.md"
+        return f"error_parsing_{abs(hash(url))}.md"
 
 
 async def crawl_website_single_site(
@@ -265,13 +276,13 @@ async def crawl_website_single_site(
 ) -> Dict[str, Any]:
     """
     Crawl a single website deeply and save each page as a cleaned Markdown file, with parallelization.
-    Applies filename exclusion rules.
+    Applies filename exclusion rules and limits crawl to the start URL's domain.
     """
     crawled_urls = set()
     queued_urls = set()
     crawl_queue = asyncio.Queue()
     semaphore = asyncio.Semaphore(max_concurrency)
-    results = {"success": [], "failed": [], "skipped_by_filter": []}
+    results = {"success": [], "failed": [], "skipped_by_filter": [], "initial_url": start_url}
 
     # Initial URL added to the queue
     if start_url:
@@ -279,7 +290,21 @@ async def crawl_website_single_site(
         queued_urls.add(start_url)
     else:
         results["failed"].append({"url": "N/A", "error": "Empty start URL provided"})
+        print("Error: Empty start URL provided to crawl_website_single_site")
         return results
+
+    # --- Extract domain for allowed_domains parameter ---
+    start_domain = urlparse(start_url).netloc
+    allowed_domains_list = []
+    if start_domain:
+        allowed_domains_list.append(start_domain)
+        print(f"Limiting crawl for {start_url} to domain: {start_domain}")
+    else:
+        print(f"Warning: Could not extract domain from {start_url}. Domain limiting may not work as expected by crawl4ai. Proceeding without explicit domain limit in config.")
+        # If domain extraction fails, allowed_domains_list will be empty,
+        # which means crawl4ai will not enforce domain limits based on this parameter.
+        # The exclude_external_links=True config might still help, but allowed_domains is preferred.
+
 
     print(f"Starting crawl for: {start_url} with max_depth={max_depth}, max_concurrency={max_concurrency}")
 
@@ -291,13 +316,15 @@ async def crawl_website_single_site(
         }
     )
 
+    # --- CORRECTED CrawlerRunConfig parameters ---
     config = CrawlerRunConfig(
         markdown_generator=md_generator,
         cache_mode="BYPASS", # Always fetch fresh content
-        exclude_external_links=True, # Only follow links within the starting domain
+        exclude_external_links=True, # Keep this, it's an additional filter that can complement allowed_domains
         exclude_social_media_links=True,
-        stay_in_domain=True # Explicitly limit to the domain of the start_url
+        allowed_domains=allowed_domains_list # <-- Use the correct parameter with the list
     )
+    # --------------------------------------------
 
     async def crawl_page(current_url: str, current_depth: int):
         """Worker function to crawl a single page."""
@@ -305,10 +332,17 @@ async def crawl_website_single_site(
             # print(f"Already visited: {current_url}") # Optional: log already visited
             return
 
+        # Add to visited set BEFORE attempting crawl to prevent race conditions
         crawled_urls.add(current_url)
         print(f"Crawling ({len(crawled_urls)}): {current_url} (Depth: {current_depth})")
 
         filename = sanitize_filename(current_url)
+        # Ensure filename doesn't exceed OS limits BEFORE creating path
+        # (Redundant with sanitize_filename[:200], but defensive)
+        max_filename_len = 200 # Reasonable limit
+        if len(filename) > max_filename_len:
+             filename = filename[:max_filename_len] # Truncate if needed
+
         output_path = os.path.join(output_dir, filename)
 
         # --- Filename Exclusion Check ---
@@ -316,22 +350,28 @@ async def crawl_website_single_site(
              print(f"Skipping save for {current_url} due to filename filter: {filename}")
              results["skipped_by_filter"].append(current_url)
              # Still process links if depth allows, even if not saving this page's content
+             # The config with allowed_domains handles limiting to the specific domain
              if current_depth < max_depth:
-                 # Need to perform the crawl to get links, even if not saving content
+                 # Need to perform the crawl to get links
                  async with semaphore:
                      async with AsyncWebCrawler(verbose=False) as crawler: # Turn off verbose for individual crawls
+                         # Check if the URL itself is within the allowed domains as a final safeguard
+                         if allowed_domains_list and urlparse(current_url).netloc not in allowed_domains_list:
+                             print(f"Warning: Queue contained URL outside allowed domains (should not happen with correct config): {current_url}")
+                             crawl_queue.task_done() # Mark done to prevent getting stuck
+                             return # Skip processing this URL
                          result = await crawler.arun(url=current_url, config=config)
+                         # crawl4ai with allowed_domains will automatically filter links
                          if result.success:
-                             internal_links = result.links.get("internal", [])
-                             # Add internal links to queue if within depth and domain, and not visited/queued
-                             domain_of_start_url = urlparse(start_url).netloc
+                             internal_links = result.links.get("internal", []) # These are already filtered by domain by crawl4ai config
+                             # Add allowed links to queue if within depth and not visited/queued
                              for link in internal_links:
                                  href = link["href"]
                                  absolute_url = urljoin(current_url, href)
-                                 if urlparse(absolute_url).netloc == domain_of_start_url:
-                                     if absolute_url not in crawled_urls and absolute_url not in queued_urls:
-                                         crawl_queue.put_nowait((absolute_url, current_depth + 1))
-                                         queued_urls.add(absolute_url)
+                                 # No need for explicit domain check here because allowed_domains handles it
+                                 if absolute_url not in crawled_urls and absolute_url not in queued_urls:
+                                     crawl_queue.put_nowait((absolute_url, current_depth + 1))
+                                     queued_urls.add(absolute_url)
                          else:
                               print(f"Failed to get links from {current_url} (skipped save): {result.error_message}")
                               # Don't add to failed results here, as the page itself wasn't the primary goal (saving was skipped)
@@ -341,6 +381,11 @@ async def crawl_website_single_site(
         # --- Normal Crawl and Save ---
         async with semaphore:
             async with AsyncWebCrawler(verbose=False) as crawler: # Turn off verbose for individual crawls
+                 # Check if the URL itself is within the allowed domains as a final safeguard
+                if allowed_domains_list and urlparse(current_url).netloc not in allowed_domains_list:
+                    print(f"Warning: Queue contained URL outside allowed domains (should not happen with correct config): {current_url}")
+                    crawl_queue.task_done() # Mark done to prevent getting stuck
+                    return # Skip processing this URL
                 result = await crawler.arun(url=current_url, config=config)
 
             if result.success:
@@ -348,6 +393,8 @@ async def crawl_website_single_site(
                 cleaned_markdown = clean_markdown(markdown_content)
 
                 try:
+                    # Ensure directory exists before writing file
+                    os.makedirs(os.path.dirname(output_path), exist_ok=True)
                     with open(output_path, "w", encoding="utf-8") as f:
                         f.write(f"# {current_url}\n\n{cleaned_markdown}\n")
                     print(f"Saved cleaned Markdown to: {output_path}")
@@ -356,15 +403,17 @@ async def crawl_website_single_site(
                     # Add links to queue if within max_depth
                     if current_depth < max_depth:
                         internal_links = result.links.get("internal", [])
-                        domain_of_start_url = urlparse(start_url).netloc
+                        # Note: The config with allowed_domains handles filtering by domain
                         for link in internal_links:
                             href = link["href"]
                             absolute_url = urljoin(current_url, href)
-                            # Only add links within the original starting domain
-                            if urlparse(absolute_url).netloc == domain_of_start_url:
-                                if absolute_url not in crawled_urls and absolute_url not in queued_urls:
-                                    crawl_queue.put_nowait((absolute_url, current_depth + 1))
-                                    queued_urls.add(absolute_url)
+                            # No need for explicit domain check here because allowed_domains handles it
+                            if absolute_url not in crawled_urls and absolute_url not in queued_urls:
+                                # Although allowed_domains is set, adding an extra check before queuing
+                                # can be slightly safer, though redundant with correct config.
+                                # Let's rely on allowed_domains filtering *within* crawl4ai for simplicity.
+                                crawl_queue.put_nowait((absolute_url, current_depth + 1))
+                                queued_urls.add(absolute_url)
 
                 except IOError as e:
                      print(f"Error saving file {output_path}: {e}")
@@ -381,18 +430,22 @@ async def crawl_website_single_site(
 
     # Create worker tasks
     # Ensure we don't try to create more tasks than queue items if queue is small initially
-    worker_tasks = [asyncio.create_task(crawl_page(*await crawl_queue.get())) for _ in range(min(max_concurrency, crawl_queue.qsize()))]
+    # Also handle the case where the queue might be empty from the start (e.g., invalid initial URL)
+    num_initial_workers = min(max_concurrency, crawl_queue.qsize())
+    worker_tasks = [asyncio.create_task(crawl_page(*await crawl_queue.get())) for _ in range(num_initial_workers)]
 
     # Wait for all tasks in the queue to be processed
     await crawl_queue.join()
 
     # Cancel remaining worker tasks (they might be waiting for queue items that won't come)
+    # Using gather with return_exceptions=True is a robust way to handle cancelled tasks
     for task in worker_tasks:
         if not task.done(): # Only cancel if not already finished
             task.cancel()
 
     # Await cancellation to avoid warnings and clean up
     await asyncio.gather(*worker_tasks, return_exceptions=True)
+
 
     print(f"Finished crawl for: {start_url}")
     return results
@@ -419,7 +472,7 @@ async def crawl_csv_upload_endpoint(
         urls_to_crawl = read_urls_from_csv(csv_content)
 
         if not urls_to_crawl:
-            return {"status": "warning", "message": "No valid URLs found in the CSV file."}
+            return {"status": "warning", "message": "No valid URLs found in the CSV file to crawl."}
 
         # Ensure output directory exists
         os.makedirs(output_dir, exist_ok=True)
@@ -431,11 +484,10 @@ async def crawl_csv_upload_endpoint(
         }
 
         # Sequentially crawl each site listed in the CSV
-        # Note: To parallelize across sites as well, a more complex queue management
-        # across sites would be needed, but this sequential approach per site is simpler
-        # and respects the concurrency setting per domain which is often desirable.
+        # This means concurrency is per site, not across all sites simultaneously
         for i, url in enumerate(urls_to_crawl):
             print(f"\n--- Processing site {i+1}/{len(urls_to_crawl)}: {url} ---")
+            # Ensure a clean state (sets, queue) for each new site crawl
             try:
                 site_results = await crawl_website_single_site(
                     start_url=url,
@@ -445,19 +497,22 @@ async def crawl_csv_upload_endpoint(
                 )
                 overall_results["site_crawl_results"][url] = site_results
             except Exception as e:
-                 print(f"An error occurred during the crawl of {url}: {e}")
-                 overall_results["site_crawl_results"][url] = {"status": "error", "message": str(e)}
+                 print(f"An unexpected error occurred during the crawl of {url}: {e}")
+                 overall_results["site_crawl_results"][url] = {"status": "error", "message": f"Unexpected error: {str(e)}"}
 
 
-        # Optional: Save overall metadata
+        # Save overall metadata
         metadata_path = os.path.join(output_dir, "overall_metadata.json")
         try:
             # Convert sets to lists for JSON serialization
             serializable_results = overall_results.copy()
             for url, res in serializable_results["site_crawl_results"].items():
-                if "success" in res: res["success"] = list(res["success"])
-                if "skipped_by_filter" in res: res["skipped_by_filter"] = list(res["skipped_by_filter"])
-                # Failed results are already serializable
+                 # Check if keys exist before trying to convert
+                if "success" in res and isinstance(res["success"], set):
+                    res["success"] = list(res["success"])
+                if "skipped_by_filter" in res and isinstance(res["skipped_by_filter"], set):
+                     res["skipped_by_filter"] = list(res["skipped_by_filter"])
+                # Failed results should already be serializable (list of dicts)
 
             with open(metadata_path, "w", encoding="utf-8") as f:
                 json.dump(serializable_results, f, indent=2)
@@ -473,44 +528,14 @@ async def crawl_csv_upload_endpoint(
 
     except Exception as e:
         # Catch any other unexpected errors during file processing or initial setup
-        raise HTTPException(status_code=500, detail=f"An error occurred: {str(e)}")
-
-# You can keep the original /crawl endpoint if you still need it,
-# but the primary functionality for the CSV is now in /crawl_csv_upload.
-# If you don't need the single URL endpoint anymore, you can remove it.
-# For now, keeping it commented out.
-
-# @app.post("/crawl")
-# async def crawl_endpoint(request: CrawlRequest):
-#     """
-#     FastAPI endpoint to crawl a single website and save content as cleaned Markdown files.
-#     """
-#     print(f"Received request to crawl single URL: {request.start_url}")
-#     result = await crawl_website_single_site(
-#         start_url=str(request.start_url),
-#         output_dir=request.output_dir,
-#         max_concurrency=request.max_concurrency,
-#         max_depth=request.max_depth
-#     )
-#     # Add metadata saving for the single crawl if this endpoint is kept
-#     metadata_path = os.path.join(request.output_dir, f"metadata_{urlparse(str(request.start_url)).netloc.replace('.', '_')}.json")
-#     try:
-#          serializable_results = result.copy()
-#          if "success" in serializable_results: serializable_results["success"] = list(serializable_results["success"])
-#          if "skipped_by_filter" in serializable_results: serializable_results["skipped_by_filter"] = list(serializable_results["skipped_by_filter"])
-#          with open(metadata_path, "w", encoding="utf-8") as f:
-#              json.dump(serializable_results, f, indent=2)
-#          result["metadata_path"] = metadata_path
-#          print(f"Metadata saved to {metadata_path}")
-#     except Exception as e:
-#          print(f"Error saving metadata: {e}")
-#          result["metadata_save_error"] = str(e)
-#
-#     return result
+        # Log the error for debugging
+        print(f"Critical error in crawl_csv_upload_endpoint: {e}")
+        raise HTTPException(status_code=500, detail=f"An internal server error occurred: {str(e)}")
 
 
 if __name__ == "__main__":
-    import uvicorn
     # To run, save the code as e.g., main.py and run 'uvicorn main:app --reload'
     # The /crawl_csv_upload endpoint expects a file upload.
+    print("Starting FastAPI application...")
+    print("Navigate to http://0.0.0.0:8002/docs for interactive documentation (Swagger UI).")
     uvicorn.run(app, host="0.0.0.0", port=8002)
